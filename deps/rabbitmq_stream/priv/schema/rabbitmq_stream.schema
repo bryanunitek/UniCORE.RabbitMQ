@@ -37,88 +37,10 @@ fun(Conf) ->
     end
 end}.
 
-{mapping, "stream.tcp_listen_options", "rabbitmq_stream.tcp_listen_options", [
-    {datatype, {enum, [none]}}]}.
-
-{translation, "rabbitmq_stream.tcp_listen_options",
-fun(Conf) ->
-    case cuttlefish:conf_get("stream.tcp_listen_options", Conf, undefined) of
-        none -> [];
-        _    -> cuttlefish:invalid("Invalid stream.tcp_listen_options")
-    end
-end}.
-
-{mapping, "stream.tcp_listen_options.backlog", "rabbitmq_stream.tcp_listen_options.backlog", [
-    {datatype, integer}
-]}.
-
-{mapping, "stream.tcp_listen_options.nodelay", "rabbitmq_stream.tcp_listen_options.nodelay", [
-    {datatype, {enum, [true, false]}}
-]}.
-
-{mapping, "stream.tcp_listen_options.buffer", "rabbitmq_stream.tcp_listen_options.buffer",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.delay_send", "rabbitmq_stream.tcp_listen_options.delay_send",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stream.tcp_listen_options.dontroute", "rabbitmq_stream.tcp_listen_options.dontroute",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stream.tcp_listen_options.exit_on_close", "rabbitmq_stream.tcp_listen_options.exit_on_close",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stream.tcp_listen_options.fd", "rabbitmq_stream.tcp_listen_options.fd",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.high_msgq_watermark", "rabbitmq_stream.tcp_listen_options.high_msgq_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.high_watermark", "rabbitmq_stream.tcp_listen_options.high_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.keepalive", "rabbitmq_stream.tcp_listen_options.keepalive",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stream.tcp_listen_options.low_msgq_watermark", "rabbitmq_stream.tcp_listen_options.low_msgq_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.low_watermark", "rabbitmq_stream.tcp_listen_options.low_watermark",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.port", "rabbitmq_stream.tcp_listen_options.port",
-    [{datatype, integer}, {validators, ["port"]}]}.
-
-{mapping, "stream.tcp_listen_options.priority", "rabbitmq_stream.tcp_listen_options.priority",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.recbuf", "rabbitmq_stream.tcp_listen_options.recbuf",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.send_timeout", "rabbitmq_stream.tcp_listen_options.send_timeout",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.send_timeout_close", "rabbitmq_stream.tcp_listen_options.send_timeout_close",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stream.tcp_listen_options.sndbuf", "rabbitmq_stream.tcp_listen_options.sndbuf",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.tos", "rabbitmq_stream.tcp_listen_options.tos",
-    [{datatype, integer}]}.
-
-{mapping, "stream.tcp_listen_options.linger.on", "rabbitmq_stream.tcp_listen_options.linger",
-    [{datatype, {enum, [true, false]}}]}.
-
-{mapping, "stream.tcp_listen_options.linger.timeout", "rabbitmq_stream.tcp_listen_options.linger",
-    [{datatype, integer}, {validators, ["non_negative_integer"]}]}.
-
-{translation, "rabbitmq_stream.tcp_listen_options.linger",
-fun(Conf) ->
-    LingerOn = cuttlefish:conf_get("stream.tcp_listen_options.linger.on", Conf, false),
-    LingerTimeout = cuttlefish:conf_get("stream.tcp_listen_options.linger.timeout", Conf, 0),
-    {LingerOn, LingerTimeout}
-end}.
+{include_partial, {rabbit, "tcp_listen_options"},
+    [{prefix, "stream.tcp_listen_options"},
+     {app_prefix, "rabbitmq_stream.tcp_listen_options"},
+     {disable_with, none}]}.
 
 %% Number of Erlang processes that will accept connections for the TCP listener
 %%
@@ -166,7 +88,7 @@ end}.
 %% Defaults to true.
 
 {mapping, "stream.ssl_cert_login", "rabbitmq_stream.ssl_cert_login",
-    [{datatype, {enum, [true, false]}}]}.
+    [{datatype, boolean}]}.
 
 {mapping, "stream.initial_credits", "rabbitmq_stream.initial_credits", [
     {datatype, integer}
