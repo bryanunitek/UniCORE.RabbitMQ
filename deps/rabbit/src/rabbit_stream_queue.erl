@@ -77,7 +77,7 @@
 -define(INFO_KEYS, [name, durable, auto_delete, arguments, leader, members, online, state,
                     messages, messages_ready, messages_unacknowledged, committed_offset,
                     policy, operator_policy, effective_policy_definition, type, memory,
-                    consumers, segments, committed_chunk_id]).
+                    consumers, segments, committed_chunk_id, first_timestamp]).
 
 -define(UNMATCHED_THRESHOLD, 200).
 
@@ -842,6 +842,14 @@ i(segments = F, Q) ->
         _ ->
             ''
     end;
+i(first_timestamp = F, Q) ->
+    Key = {osiris_writer, amqqueue:get_name(Q)},
+    case osiris_counters:counters(Key, [F]) of
+        #{F := V} ->
+            V;
+        _ ->
+            ''
+    end;
 i(policy, Q) ->
     case rabbit_policy:name(Q) of
         none   -> '';
@@ -1207,7 +1215,7 @@ matches_strategy(even, Members) ->
     length(Members) rem 2 == 0.
 
 is_match(Subj, E) ->
-    nomatch /= re:run(Subj, E).
+    rabbit_re:matches(Subj, E).
 
 get_resource_name(#resource{name = Name}) ->
     Name.

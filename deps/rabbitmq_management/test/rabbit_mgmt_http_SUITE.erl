@@ -133,6 +133,10 @@ all_tests() -> [
     vhosts_test,
     vhosts_description_test,
     vhosts_trace_test,
+    vhosts_default_queue_type_empty_string_rejected_test,
+    vhosts_default_queue_type_unknown_rejected_test,
+    vhosts_default_queue_type_update_empty_string_rejected_test,
+    vhosts_default_queue_type_update_unknown_rejected_test,
     users_legacy_administrator_test,
     adding_a_user_with_password_test,
     adding_a_user_with_password_hash_test,
@@ -189,6 +193,7 @@ all_tests() -> [
     publish_large_message_exceeding_http_request_body_size_test,
     publish_body_size_limit_single_chunk_test,
     direct_request_body_size_limit_test,
+    definitions_multipart_body_size_limit_test,
     publish_accept_json_test,
     publish_fail_test,
     publish_base64_test,
@@ -604,6 +609,38 @@ vhosts_trace_test(Config) ->
 
     passed.
 
+vhosts_default_queue_type_empty_string_rejected_test(Config) ->
+    http_put(Config, "/vhosts/dqt-empty-vhost",
+             [{default_queue_type, <<"">>}], ?BAD_REQUEST),
+    http_get(Config, "/vhosts/dqt-empty-vhost", ?NOT_FOUND),
+    passed.
+
+vhosts_default_queue_type_unknown_rejected_test(Config) ->
+    http_put(Config, "/vhosts/dqt-unknown-vhost",
+             [{default_queue_type, <<"made-up-queue-type">>}], ?BAD_REQUEST),
+    http_get(Config, "/vhosts/dqt-unknown-vhost", ?NOT_FOUND),
+    passed.
+
+vhosts_default_queue_type_update_empty_string_rejected_test(Config) ->
+    http_put(Config, "/vhosts/dqt-update-empty-vhost",
+             [{default_queue_type, <<"classic">>}], {group, '2xx'}),
+    http_put(Config, "/vhosts/dqt-update-empty-vhost",
+             [{default_queue_type, <<"">>}], ?BAD_REQUEST),
+    Result = http_get(Config, "/vhosts/dqt-update-empty-vhost"),
+    #{metadata := #{default_queue_type := <<"classic">>}} = Result,
+    http_delete(Config, "/vhosts/dqt-update-empty-vhost", {group, '2xx'}),
+    passed.
+
+vhosts_default_queue_type_update_unknown_rejected_test(Config) ->
+    http_put(Config, "/vhosts/dqt-update-unknown-vhost",
+             [{default_queue_type, <<"classic">>}], {group, '2xx'}),
+    http_put(Config, "/vhosts/dqt-update-unknown-vhost",
+             [{default_queue_type, <<"made-up-queue-type">>}], ?BAD_REQUEST),
+    Result = http_get(Config, "/vhosts/dqt-update-unknown-vhost"),
+    #{metadata := #{default_queue_type := <<"classic">>}} = Result,
+    http_delete(Config, "/vhosts/dqt-update-unknown-vhost", {group, '2xx'}),
+    passed.
+
 users_test(Config) ->
     assert_item(#{name => <<"guest">>, tags => [<<"administrator">>]},
                 http_get(Config, "/whoami")),
@@ -857,8 +894,19 @@ csv_tags(N) ->
 %% "external" authentication mechanism or backend is used.
 %% See rabbitmq/rabbitmq-management#383.
 adding_a_user_without_password_or_hash_test(Config) ->
+    %% Regression: rabbitmq/rabbitmq-server#16629.
     http_put(Config, "/users/no-pwd", [{tags, <<"management">>}], [?CREATED, ?NO_CONTENT]),
+    assert_item(#{name              => <<"no-pwd">>,
+                  tags              => [<<"management">>],
+                  password_hash     => <<>>,
+                  hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
+                http_get(Config, "/users/no-pwd")),
     http_put(Config, "/users/no-pwd", [{tags, <<"management">>}], [?CREATED, ?NO_CONTENT]),
+    assert_item(#{name              => <<"no-pwd">>,
+                  tags              => [<<"management">>],
+                  password_hash     => <<>>,
+                  hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
+                http_get(Config, "/users/no-pwd")),
     http_delete(Config, "/users/no-pwd", ?NO_CONTENT).
 
 adding_a_user_with_both_password_and_hash_fails_test(Config) ->
@@ -3392,6 +3440,27 @@ direct_request_body_size_limit_test(Config) ->
     rpc(Config, application, unset_env, [rabbitmq_management, max_http_body_size])
   end.
 
+definitions_multipart_body_size_limit_test(Config) ->
+    rpc(Config, application, set_env, [rabbitmq_management, max_http_body_size, 200]),
+    try
+        %% A small but valid definitions payload, turned into an oversized
+        %% multipart upload by appending padding.
+        SmallDefs = #{users => [], vhosts => [#{name => <<"test">>}]},
+        Data = binary_to_list(format_for_upload(SmallDefs)),
+        Boundary = "------------definitions_multipart_body_size_limit_test",
+        LargeBody = list_to_binary(lists:duplicate(300, $\s)),
+        OversizedMultipart = format_multipart_filedata(Boundary,
+            [{file, "file", Data ++ binary_to_list(LargeBody)}]),
+        ContentType = lists:concat(["multipart/form-data; boundary=", Boundary]),
+        MoreHeaders = [{"content-type", ContentType},
+                       {"content-length", integer_to_list(length(OversizedMultipart))}],
+        http_upload_raw(Config, post, "/definitions", OversizedMultipart,
+                        "guest", "guest", ?BAD_REQUEST, MoreHeaders),
+        passed
+    after
+        rpc(Config, application, unset_env, [rabbitmq_management, max_http_body_size])
+    end.
+
 publish_accept_json_test(Config) ->
     Headers = #{'x-forwarding' => [#{uri => <<"amqp://localhost/%2F/upstream">>}]},
     Msg = msg(<<"publish_accept_json_test">>, Headers, <<"Hello world">>),
@@ -4137,15 +4206,7 @@ login_test(Config) ->
             [{"content-type", "application/x-www-form-urlencoded"}],
             <<"username=myuser&password=myuser">>),
     ?assertEqual(200, CodeAct),
-
-    %% Extract the authorization header
-    Cookie = list_to_binary(proplists:get_value("set-cookie", Headers)),
-    [_, Auth] = binary:split(Cookie, <<"=">>, []),
-
-    %% Request the overview with the auth obtained
-    {ok, {{_, CodeAct1, _}, _, _}} =
-        req(Config, get, "/overview", [{"Authorization", "Basic " ++ binary_to_list(Auth)}]),
-    ?assertEqual(200, CodeAct1),
+    ?assert(not proplists:is_defined("set-cookie", Headers)),
 
     %% Let's request a login with an unknown user
     {ok, {{_, CodeAct2, _}, Headers2, _}} =
