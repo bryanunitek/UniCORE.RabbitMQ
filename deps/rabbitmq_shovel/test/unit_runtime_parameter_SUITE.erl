@@ -37,8 +37,10 @@ groups() ->
           validate_amqp10_with_a_map,
           test_src_protocol_defaults,
           test_src_protocol_explicit,
+          test_src_protocol_unknown,
           test_dest_protocol_defaults,
           test_dest_protocol_explicit,
+          test_dest_protocol_unknown,
           test_protocols_defaults,
           test_protocols_explicit,
           test_protocols_mixed,
@@ -181,15 +183,18 @@ test_parse_amqp091(Params) ->
       name := "name",
       reconnect_delay := 1001,
       dest := #{module := rabbit_amqp091_shovel,
-                uris := ["amqp://remotehost:5672"],
+                uris := [{encrypted, _}],
                 props_fun := {M, F, Args}
                },
       source := #{module := rabbit_amqp091_shovel,
-                  uris := ["amqp://localhost:5672"],
+                  uris := [{encrypted, _}],
                   prefetch_count := 30,
                   queue := <<"a-src-queue">>,
                   delete_after := 'queue-length'}
      } = Result,
+    assert_uris_round_trip(Result,
+                           ["amqp://localhost:5672"],
+                           ["amqp://remotehost:5672"]),
 
     #'P_basic'{headers = ActualHeaders,
                delivery_mode = 2,
@@ -207,21 +212,30 @@ test_parse_amqp091_with_blank_proprties(Params) ->
       name := "name",
       reconnect_delay := 1001,
       dest := #{module := rabbit_amqp091_shovel,
-                uris := ["amqp://remotehost:5672"],
+                uris := [{encrypted, _}],
                 props_fun := {M, F, Args}
                },
       source := #{module := rabbit_amqp091_shovel,
-                  uris := ["amqp://localhost:5672"],
+                  uris := [{encrypted, _}],
                   prefetch_count := 30,
                   queue := <<"a-src-queue">>,
                   delete_after := 'queue-length'}
      } = Result,
+    assert_uris_round_trip(Result,
+                           ["amqp://localhost:5672"],
+                           ["amqp://remotehost:5672"]),
 
     #'P_basic'{headers = ActualHeaders} = apply(M, F, Args ++ ["amqp://localhost:5672",
                                                                "amqp://remotehost:5672",
                                                                #'P_basic'{headers = undefined}]),
     assert_amqp901_headers(ActualHeaders),
     ok.
+
+assert_uris_round_trip(#{source := #{uris := SrcUris},
+                         dest := #{uris := DestUris}},
+                       ExpectedSrcUris, ExpectedDestUris) ->
+    ?assertEqual(ExpectedSrcUris, rabbit_shovel_util:deobfuscate_uris(SrcUris)),
+    ?assertEqual(ExpectedDestUris, rabbit_shovel_util:deobfuscate_uris(DestUris)).
 
 assert_amqp901_headers(ActualHeaders) ->
     {_, array, [{table, Shovelled}]} = lists:keyfind(<<"x-shovelled">>, 1, ActualHeaders),
@@ -269,29 +283,28 @@ parse_amqp10_0() ->
          {<<"dest-properties">>, [{<<"user_id">>, <<"some-user">>}]}
         ],
     ObfuscatedParams = rabbit_shovel_parameters:obfuscate_uris_in_definition(Params),
+    {ok, Result} = rabbit_shovel_parameters:parse({"vhost", "my_shovel"},
+                                                  "my-cluster", ObfuscatedParams),
     ?assertMatch(
-       {ok, #{name := "my_shovel",
-              ack_mode := on_publish,
-              source := #{module := rabbit_amqp10_shovel,
-                          uris := ["amqp://localhost:5672"],
-                          delete_after := never,
-                          prefetch_count := 30,
-                          source_address := <<"a-src-queue">>
-                          },
-              dest := #{module := rabbit_amqp10_shovel,
-                        uris := ["amqp://remotehost:5672"],
-                        target_address := <<"a-dest-queue">>,
-                        message_annotations := #{<<"some-message-ann">> :=
-                                                 <<"message-ann-value">>},
-                        application_properties := #{<<"some-app-prop">> :=
-                                                    <<"app-prop-value">>},
-                        properties := #{user_id := <<"some-user">>},
-                        add_timestamp_header := true,
-                        add_forward_headers := true
-                       }
-             }},
-        rabbit_shovel_parameters:parse({"vhost", "my_shovel"}, "my-cluster",
-                                       ObfuscatedParams)),
+       #{name := "my_shovel",
+         ack_mode := on_publish,
+         source := #{module := rabbit_amqp10_shovel,
+                     uris := [{encrypted, _}],
+                     delete_after := never,
+                     prefetch_count := 30,
+                     source_address := <<"a-src-queue">>
+                     },
+         dest := #{module := rabbit_amqp10_shovel,
+                   uris := [{encrypted, _}],
+                   target_address := <<"a-dest-queue">>,
+                   add_timestamp_header := true,
+                   add_forward_headers := true
+                  }
+        },
+        Result),
+    assert_uris_round_trip(Result,
+                           ["amqp://localhost:5672"],
+                           ["amqp://remotehost:5672"]),
     ok.
 
 parse_amqp10_minimal(Config) ->
@@ -309,22 +322,26 @@ parse_amqp10_minimal_0() ->
          {<<"dest-address">>, <<"a-dest-queue">>}
         ],
     ObfuscatedParams = rabbit_shovel_parameters:obfuscate_uris_in_definition(Params),
+    {ok, Result} = rabbit_shovel_parameters:parse({"vhost", "my_shovel"},
+                                                  "my-cluster", ObfuscatedParams),
     ?assertMatch(
-       {ok, #{name := "my_shovel",
-              ack_mode := on_confirm,
-              source := #{module := rabbit_amqp10_shovel,
-                          uris := ["amqp://localhost:5672"],
-                          delete_after := never,
-                          source_address := <<"a-src-queue">>
-                          },
-              dest := #{module := rabbit_amqp10_shovel,
-                        uris := ["amqp://remotehost:5672"],
-                        unacked := #{},
-                        target_address := <<"a-dest-queue">>
-                       }
-             }},
-        rabbit_shovel_parameters:parse({"vhost", "my_shovel"}, "my-cluster",
-                                       ObfuscatedParams)),
+       #{name := "my_shovel",
+         ack_mode := on_confirm,
+         source := #{module := rabbit_amqp10_shovel,
+                     uris := [{encrypted, _}],
+                     delete_after := never,
+                     source_address := <<"a-src-queue">>
+                     },
+         dest := #{module := rabbit_amqp10_shovel,
+                   uris := [{encrypted, _}],
+                   unacked := #{},
+                   target_address := <<"a-dest-queue">>
+                  }
+        },
+        Result),
+    assert_uris_round_trip(Result,
+                           ["amqp://localhost:5672"],
+                           ["amqp://remotehost:5672"]),
     ok.
 
 validate_amqp10(Config) ->
@@ -432,6 +449,13 @@ test_src_protocol_explicit(_Config) ->
     ?assertEqual(local, rabbit_shovel_parameters:src_protocol(DefMapLocal)),
     ok.
 
+test_src_protocol_unknown(_Config) ->
+    ?assertEqual(amqp091, rabbit_shovel_parameters:src_protocol(
+                            [{<<"src-protocol">>, <<"not-a-real-protocol">>}])),
+    ?assertEqual(amqp091, rabbit_shovel_parameters:src_protocol(
+                            #{<<"src-protocol">> => <<"not-a-real-protocol">>})),
+    ok.
+
 test_dest_protocol_defaults(_Config) ->
     DefProplist = [{<<"src-uri">>, <<"amqp://localhost">>},
                    {<<"dest-uri">>, <<"amqp://remote">>}],
@@ -460,6 +484,13 @@ test_dest_protocol_explicit(_Config) ->
 
     DefMapLocal = #{<<"dest-protocol">> => <<"local">>},
     ?assertEqual(local, rabbit_shovel_parameters:dest_protocol(DefMapLocal)),
+    ok.
+
+test_dest_protocol_unknown(_Config) ->
+    ?assertEqual(amqp091, rabbit_shovel_parameters:dest_protocol(
+                            [{<<"dest-protocol">>, <<"not-a-real-protocol">>}])),
+    ?assertEqual(amqp091, rabbit_shovel_parameters:dest_protocol(
+                            #{<<"dest-protocol">> => <<"not-a-real-protocol">>})),
     ok.
 
 test_protocols_defaults(_Config) ->

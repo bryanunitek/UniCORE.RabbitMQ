@@ -21,7 +21,7 @@
          is_authorized_global_parameters/3]).
 
 -export([id/2]).
--export([not_authorised/3, halt_response/5]).
+-export([not_authorised/3, not_found/3, halt_response/5]).
 
 -export([is_admin/1, is_policymaker/1, is_monitor/1, is_mgmt_user/1, is_protected_user/1]).
 
@@ -131,9 +131,12 @@ is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig, R
     ErrFun = fun (ResolvedUserName, Msg) ->
                      ?LOG_WARNING("HTTP access denied: user '~ts' - ~ts",
                                         [ResolvedUserName, Msg]),
+                     %% Include the resolved username in the access log.
+                     ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(
+                                  ResolvedUserName, ReqData),
                      case ReplyWhenFailed of
-                       true -> not_authorised(Msg, ReqData, Context);
-                       false -> {false, ReqData, "Not_Authorized"}
+                       true -> not_authorised(Msg, ReqData1, Context);
+                       false -> {false, ReqData1, "Not_Authorized"}
                      end
              end,
     {IP, _} = cowboy_req:peer(ReqData),
@@ -154,11 +157,16 @@ is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig, R
                     case is_mgmt_user(Tags) of
                         true ->
                             case Fun(User) of
-                                true  ->
+                                true ->
                                     rabbit_core_metrics:auth_attempt_succeeded(IP, ResolvedUsername, http),
-                                    {true, ReqData,
+                                    ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(
+                                        ResolvedUsername, ReqData),
+                                    {true, ReqData1,
                                      Context#context{user     = User,
                                                      password = Password}};
+                                not_found ->
+                                    rabbit_core_metrics:auth_attempt_failed(IP, ResolvedUsername, http),
+                                    not_found(<<"Not Found">>, ReqData, Context);
                                 false ->
                                     rabbit_core_metrics:auth_attempt_failed(IP, ResolvedUsername, http),
                                     ErrFun(ResolvedUsername, ErrorMsg)
@@ -175,9 +183,12 @@ is_authorized(ReqData, Context, Username, Password, ErrorMsg, Fun, AuthConfig, R
             rabbit_core_metrics:auth_attempt_failed(IP, Username, http),
             ?LOG_WARNING("HTTP access denied: ~ts",
                                [rabbit_misc:format(Msg, Args)]),
+            %% Include the attempted username in the access log.
+            ReqData1 = rabbit_cowboy_stream_h:set_authenticated_username(
+                         Username, ReqData),
             case ReplyWhenFailed of
-              true -> not_authenticated(<<"Not_Authorized">>, ReqData, Context, AuthConfig);
-              false -> {false, ReqData, "Not_Authorized"}
+              true -> not_authenticated(<<"Not_Authorized">>, ReqData1, Context, AuthConfig);
+              false -> {false, ReqData1, "Not_Authorized"}
             end
     end.
 
@@ -256,7 +267,10 @@ user_matches_vhost(ReqData, User) ->
         not_found -> true;
         none      -> true;
         V         ->
-            check_vhost_access(ReqData, User, V)
+            case check_vhost_access(ReqData, User, V) of
+                true  -> true;
+                false -> not_found
+            end
     end.
 
 user_matches_vhost_visible(ReqData, User = #user{tags = Tags}) ->
@@ -268,7 +282,10 @@ user_matches_vhost_visible(ReqData, User = #user{tags = Tags}) ->
                 true  ->
                     rabbit_vhost:exists(V);
                 false ->
-                    check_vhost_access(ReqData, User, V)
+                    case check_vhost_access(ReqData, User, V) of
+                        true  -> true;
+                        false -> not_found
+                    end
             end
     end.
 
@@ -286,8 +303,10 @@ check_vhost_access(ReqData, User, VHost) ->
     end.
 
 not_authorised(Reason, ReqData, Context) ->
-    %% TODO: consider changing to 403 in 4.0
     halt_response(401, not_authorised, Reason, ReqData, Context).
+
+not_found(Reason, ReqData, Context) ->
+    halt_response(404, not_found, Reason, ReqData, Context).
 
 halt_response(Code, Type, Reason, ReqData, Context) ->
     ReasonFormatted = format_reason(Reason),

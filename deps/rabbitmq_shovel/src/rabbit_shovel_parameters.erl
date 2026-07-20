@@ -104,13 +104,10 @@ validate_dest(Def) ->
 
 obfuscate_uris_in_definition(Def) ->
   SrcURIs  = get_uris(<<"src-uri">>, Def),
-  ObfuscatedSrcURIsDef = pset(<<"src-uri">>, obfuscate_uris(SrcURIs), Def),
+  ObfuscatedSrcURIsDef = pset(<<"src-uri">>, rabbit_shovel_util:obfuscate_uris(SrcURIs), Def),
   DestURIs  = get_uris(<<"dest-uri">>, Def),
-  ObfuscatedDef = pset(<<"dest-uri">>, obfuscate_uris(DestURIs), ObfuscatedSrcURIsDef),
+  ObfuscatedDef = pset(<<"dest-uri">>, rabbit_shovel_util:obfuscate_uris(DestURIs), ObfuscatedSrcURIsDef),
   ObfuscatedDef.
-
-obfuscate_uris(URIs) ->
-  [credentials_obfuscation:encrypt(URI) || URI <- URIs].
 
 shovel_validation() ->
     AllProtocols = list_all_protocols(),
@@ -147,18 +144,16 @@ src_protocol(Def) when is_map(Def) ->
     src_protocol(rabbit_data_coercion:to_proplist(Def));
 src_protocol(Def) when is_list(Def) ->
     case lists:keyfind(<<"src-protocol">>, 1, Def) of
-        {_, SrcProtocol} ->
-            rabbit_data_coercion:to_atom(SrcProtocol);
-        false -> amqp091
+        {_, Protocol} -> registered_protocol_to_atom(Protocol);
+        false         -> amqp091
     end.
 
 dest_protocol(Def) when is_map(Def) ->
     dest_protocol(rabbit_data_coercion:to_proplist(Def));
 dest_protocol(Def) when is_list(Def) ->
     case lists:keyfind(<<"dest-protocol">>, 1, Def) of
-        {_, DstProtocol} ->
-            rabbit_data_coercion:to_atom(DstProtocol);
-        false -> amqp091
+        {_, Protocol} -> registered_protocol_to_atom(Protocol);
+        false         -> amqp091
     end.
 
 protocols(Def) when is_map(Def) ->
@@ -167,6 +162,12 @@ protocols(Def) ->
     Src = src_protocol(Def),
     Dst = dest_protocol(Def),
     {Src, Dst}.
+
+registered_protocol_to_atom(Protocol) when is_atom(Protocol) -> Protocol;
+registered_protocol_to_atom(<<"amqp091">>)                  -> amqp091;
+registered_protocol_to_atom(<<"amqp10">>)                   -> amqp10;
+registered_protocol_to_atom(<<"local">>)                    -> local;
+registered_protocol_to_atom(_)                              -> amqp091.
 
 %%----------------------------------------------------------------------------
 

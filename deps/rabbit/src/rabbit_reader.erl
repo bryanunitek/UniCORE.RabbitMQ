@@ -610,7 +610,7 @@ handle_other({conserve_resources, Source, Conserve},
           end,
     control_throttle(State#v1{throttle = Throttle#throttle{blocked_by = Blockers1}});
 handle_other({channel_closing, ChPid}, State) ->
-    ok = rabbit_channel:ready_for_close(ChPid),
+    ok = rabbit_channel_common:ready_for_close(ChPid),
     {_, State1} = channel_cleanup(ChPid, State),
     maybe_close(control_throttle(State1));
 handle_other({'EXIT', Parent, normal}, State = #v1{parent = Parent}) ->
@@ -1091,11 +1091,11 @@ process_frame(Frame, Channel, State) ->
                     put(ChKey, {ChPid, NewAState}),
                     post_process_frame(Frame, ChPid, State1);
                 {ok, Method, NewAState} ->
-                    rabbit_channel:do(ChPid, Method),
+                    rabbit_channel_common:do(ChPid, Method),
                     put(ChKey, {ChPid, NewAState}),
                     post_process_frame(Frame, ChPid, State1);
                 {ok, Method, Content, NewAState} ->
-                    rabbit_channel:do_flow(ChPid, Method, Content),
+                    rabbit_channel_common:do_flow(ChPid, Method, Content),
                     put(ChKey, {ChPid, NewAState}),
                     post_process_frame(Frame, ChPid, control_throttle(State1));
                 {error, Reason} ->
@@ -1603,13 +1603,12 @@ infos(Items, State) -> [{Item, i(Item, State)} || Item <- Items].
 
 i(pid,                #v1{}) -> self();
 i(node,               #v1{}) -> node();
-i(SockStat,           S) when SockStat =:= recv_oct;
-                              SockStat =:= recv_cnt;
-                              SockStat =:= send_oct;
-                              SockStat =:= send_cnt;
-                              SockStat =:= send_pend ->
-    socket_info(fun (Sock) -> rabbit_net:getstat(Sock, [SockStat]) end,
-                fun ([{_, I}]) -> I end, S);
+i(SockStat, #v1{sock = Sock}) when SockStat =:= recv_oct;
+                                   SockStat =:= recv_cnt;
+                                   SockStat =:= send_oct;
+                                   SockStat =:= send_cnt;
+                                   SockStat =:= send_pend ->
+    rabbit_net:getstat_or_zero(Sock, SockStat);
 i(ssl, #v1{sock = Sock, proxy_socket = ProxySock}) ->
     rabbit_net:proxy_ssl_info(Sock, ProxySock) /= nossl;
 i(SSL, #v1{sock = Sock, proxy_socket = ProxySock})
@@ -1681,15 +1680,6 @@ ic(auth_mechanism,    #connection{auth_mechanism = {Name, _Mod}}) -> Name;
 ic(connected_at,      #connection{connected_at = T}) -> T;
 ic(container_id, _) -> ''; % AMQP 1.0 specific field
 ic(Item,              #connection{}) -> throw({bad_argument, Item}).
-
-socket_info(Get, Select, #v1{sock = Sock}) ->
-    case Get(Sock) of
-        {ok,    T} -> case Select(T) of
-                          N when is_number(N) -> N;
-                          _ -> 0
-                      end;
-        {error, _} -> 0
-    end.
 
 maybe_emit_stats(State) ->
     rabbit_event:if_enabled(State, #v1.stats_timer,
