@@ -137,8 +137,25 @@ internal_check_user_login(Username, Fun) ->
                 _    -> Refused
             end;
         {error, not_found} ->
+            %% Equalise timing regardless of whether the username exists to
+            %% prevent username enumeration via a timing side-channel.
+            %% The result is always discarded.
+            _ = Fun(dummy_sentinel_user()),
             Refused
     end.
+
+%% A sentinel internal_user whose password hash will never match any real
+%% cleartext. Used solely to perform a dummy hash computation on the
+%% not-found path, equalising timing with the found-but-wrong-password path.
+%% Layout: 4 bytes zeroed salt + 32 bytes zeroed SHA-256 payload.
+-define(DUMMY_PASSWORD_HASH, <<0:32, 0:256>>).
+
+dummy_sentinel_user() ->
+    HashingMod = rabbit_password:hashing_mod(),
+    internal_user:set_password_hash(
+        internal_user:new({hashing_algorithm, HashingMod}),
+        ?DUMMY_PASSWORD_HASH,
+        HashingMod).
 
 check_vhost_access(#auth_user{username = Username}, VHostPath, _AuthzData) ->
     rabbit_db_user:get_user_permissions(Username, VHostPath) =/= undefined.
@@ -191,29 +208,18 @@ check_topic_access(#auth_user{username = Username},
             end
     end.
 
+-spec expand_topic_permission(binary(), #{binary() => binary()} | undefined) ->
+    binary().
 expand_topic_permission(Permission, ToExpand) when is_map(ToExpand) ->
     Opening = <<"{">>,
     Closing = <<"}">>,
     ReplaceFun = fun(K, V, Acc) ->
                     Placeholder = <<Opening/binary, K/binary, Closing/binary>>,
-                    binary:replace(Acc, Placeholder, escape_regex(V), [global])
+                    binary:replace(Acc, Placeholder, rabbit_re:escape(V), [global])
                  end,
     maps:fold(ReplaceFun, Permission, ToExpand);
 expand_topic_permission(Permission, _ToExpand) ->
     Permission.
-
--spec escape_regex(binary()) -> binary().
-escape_regex(Bin) when is_binary(Bin) ->
-    << <<(escape_regex_char(C))/binary>> || <<C>> <= Bin >>.
-
-escape_regex_char(C)
-  when C =:= $\\; C =:= $^; C =:= $$; C =:= $.;
-       C =:= $|; C =:= $?; C =:= $*; C =:= $+;
-       C =:= $(; C =:= $); C =:= $[; C =:= $];
-       C =:= ${; C =:= $} ->
-    <<$\\, C>>;
-escape_regex_char(C) ->
-    <<C>>.
 
 permission_index(configure) -> #permission.configure;
 permission_index(write)     -> #permission.write;

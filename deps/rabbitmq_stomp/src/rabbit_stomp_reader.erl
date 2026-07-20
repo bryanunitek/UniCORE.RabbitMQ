@@ -432,7 +432,8 @@ processor_args(Configuration, Sock) ->
                               exit({send_failed, Reason})
                       end
               end,
-    {ok, {PeerAddr, _PeerPort}} = rabbit_net:peername(RealSocket),
+    %% Resolve the peer from the proxy-aware socket.
+    {ok, {PeerAddr, _PeerPort, _Host, _Port}} = rabbit_net:socket_ends(Sock, inbound),
     {SendFun, adapter_info(Sock),
      ssl_login_name(RealSocket, Configuration), PeerAddr}.
 
@@ -497,10 +498,7 @@ info_internal(SockStat, #reader_state{socket = Sock}) when SockStat =:= recv_oct
                                                            SockStat =:= send_oct;
                                                            SockStat =:= send_cnt;
                                                            SockStat =:= send_pend ->
-    case rabbit_net:getstat(Sock, [SockStat]) of
-        {ok, [{_, N}]} when is_number(N) -> N;
-        _ -> 0
-    end;
+    rabbit_net:getstat_or_zero(Sock, SockStat);
 info_internal(state, State) -> info_internal(connection_state, State);
 info_internal(garbage_collection, _State) ->
     rabbit_misc:get_gc_info(self());

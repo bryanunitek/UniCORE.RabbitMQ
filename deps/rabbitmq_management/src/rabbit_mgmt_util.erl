@@ -18,7 +18,7 @@
          is_authorized_vhost_visible_for_monitoring/2,
          is_authorized_global_parameters/2]).
 -export([user/1]).
--export([bad_request/3, service_unavailable/3, bad_request_exception/4,
+-export([bad_request/3, bad_request/4, service_unavailable/3, bad_request_exception/4,
          internal_server_error/3, internal_server_error/4, precondition_failed/3,
          id/2, parse_bool/1, parse_int/1, redirect_to_home/3]).
 -export([with_decode/4, with_ids/4, not_found/3]).
@@ -46,6 +46,7 @@
 -export([direct_request/6]).
 -export([qs_val/2]).
 -export([get_path_prefix/0]).
+-export([prefixed_path/1]).
 -export([catch_no_such_user_or_vhost/2]).
 -export([method_not_allowed/3]).
 
@@ -466,6 +467,12 @@ fixup_prefix(EnvPrefix) when is_list(EnvPrefix) ->
 fixup_prefix(EnvPrefix) when is_binary(EnvPrefix) ->
     fixup_prefix(rabbit_data_coercion:to_list(EnvPrefix)).
 
+%% Prepends the configured path prefix to Path, returning a binary.
+%% Used wherever a cookie or redirect path must reflect the management
+%% plugin's configured path_prefix.
+prefixed_path(Path) ->
+    iolist_to_binary([get_path_prefix(), Path]).
+
 %% XXX sort_list_and_paginate/2 is a more proper name for this function, keeping it
 %% with this name for backwards compatibility
 -spec sort_list([Fact], [string()]) -> [Fact] when
@@ -690,6 +697,16 @@ a2b(B)                 -> B.
 
 bad_request(Reason, ReqData, Context) ->
     halt_response(400, bad_request, Reason, ReqData, Context).
+
+%% Like bad_request/3 but merges ExtraFields into the JSON response body.
+%% Reason must be a binary or string.
+bad_request(Reason, ExtraFields, ReqData, Context) ->
+    ReasonBin = rabbit_data_coercion:to_binary(Reason),
+    Json = maps:merge(#{error => bad_request, reason => ReasonBin}, ExtraFields),
+    ReqData1 = cowboy_req:reply(400,
+        #{<<"content-type">> => <<"application/json">>},
+        rabbit_json:encode(Json), ReqData),
+    {stop, ReqData1, Context}.
 
 service_unavailable(Reason, ReqData, Context) ->
     halt_response(503, service_unavailable, Reason, ReqData, Context).
