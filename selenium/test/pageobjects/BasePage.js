@@ -38,16 +38,18 @@ module.exports = class BasePage {
     this.interactionDelay = parseInt(process.env.SELENIUM_INTERACTION_DELAY) || 0 // slow down interactions (when rabbit is behind a http proxy)
   }
   async ensureSectionIsVisible(section) {
-    let classes = await this.driver.findElement(section).getAttribute("class")
-    if (classes.search('section-visible') < 0) {
+    let element = await this.waitForLocated(section)
+    let classes = await element.getAttribute("class")
+    if (!classes || classes.search('section-visible') < 0) {
       return this.click(section)
     } else {
       return Promise.resolve(true)
     }
   }
   async ensureSectionIsInvisible(section) {
-    let classes = await this.driver.findElement(section).getAttribute("class")
-    if (classes.search('section-visible') >= 0) {
+    let element = await this.waitForLocated(section)
+    let classes = await element.getAttribute("class")
+    if (classes && classes.search('section-visible') >= 0) {
       return this.click(section)
     } else {
       return Promise.resolve(true)
@@ -466,6 +468,7 @@ module.exports = class BasePage {
   async sendKeys (locator, keys) {
     return this.retryOnStale(async () => {
       const element = await this.waitForDisplayed(locator)
+      await this.scrollTo(element)
       await element.click()
       await element.clear()
       return element.sendKeys(keys)
