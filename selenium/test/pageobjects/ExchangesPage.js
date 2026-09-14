@@ -1,5 +1,7 @@
 const { By, Key, until, Builder } = require('selenium-webdriver')
 
+const { doUntil } = require('../utils')
+
 const BasePage = require('./BasePage')
 
 
@@ -14,6 +16,8 @@ const TABLE_SECTION = By.css('div#exchanges-table-section table')
 const FILTER_BY_EXCHANGE_NAME = By.css('div.filter input#exchanges-name')
 const PAGE_SIZE_INPUT = By.css('input#exchanges-pagesize')
 const PAGE_SELECT = By.css('select#exchanges-page')
+
+const ARGUMENT_LINKS = By.css('div#add-new-exchange table.argument-links')
 
 module.exports = class ExchangesPage extends BasePage {
   async isLoaded () {
@@ -39,7 +43,22 @@ module.exports = class ExchangesPage extends BasePage {
   async fillInAddNewExchange(exchangeDetails) {
     await this.selectOptionByValue(FORM_EXCHANGE_TYPE, exchangeDetails.type)
     await this.sendKeys(FORM_EXCHANGE_NAME, exchangeDetails.name)
-    return this.click(ADD_BUTTON)    
+    return this.click(ADD_BUTTON)
+  }
+  async selectExchangeType(type) {
+    await this.selectOptionByValue(FORM_EXCHANGE_TYPE, type)
+    return doUntil(
+      async () => {
+        const sel = await this.driver.findElement(FORM_EXCHANGE_TYPE)
+        return sel.getAttribute('value')
+      },
+      val => val === type,
+      200,
+      `Failed to select exchange type ${type}`
+    )
+  }
+  async getArgumentLinksText() {
+    return this.getText(ARGUMENT_LINKS)
   }
   async filterExchanges(filterValue) {
     await this.waitForDisplayed(FILTER_BY_EXCHANGE_NAME)

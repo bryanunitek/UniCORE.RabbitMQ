@@ -18,7 +18,16 @@ const CONSUMER_OWNER_FORMATTERS = [
         }
     }},
     {order: 100, formatter: function(consumer) {
-        return link_channel(consumer.channel_details.name);
+        var cd = consumer.channel_details;
+        if (cd.name) {
+            return link_channel(cd.name);
+        }
+        // Consumers of channel-less protocols (e.g. MQTT) belong
+        // directly to a connection.
+        if (cd.connection_name) {
+            return link_conn(cd.connection_name);
+        }
+        return UNKNOWN_REPR;
     }}
 ];
 
@@ -42,8 +51,6 @@ function fmt_string(str, unknown) {
 }
 
 function fmt_si_prefix(num0, max0, binary, allow_fractions) {
-    if (num == 0) return 0;
-
     var thousand = binary ? 1024 : 1000;
     function f(n, m, p) {
         if (m > thousand) return f(n / thousand, m / thousand, p + 1);
@@ -183,11 +190,14 @@ function args_to_features(obj) {
     var res = {};
     for (var k in obj.arguments) {
         if (k in KNOWN_ARGS) {
-            res[k] = fmt_escape_feature(obj.arguments[k]);
+            // Exclude SAC which is the only boolean feature
+            if (obj.arguments[k] !== false) {
+                res[k] = obj.arguments[k];
+            }
         }
         else {
             if (res.arguments == undefined) res.arguments = {};
-            res.arguments[fmt_escape_html(k)] = fmt_escape_html(obj.arguments[k]);
+            res.arguments[fmt_escape_html(k)] = obj.arguments[k];
         }
     }
     if (obj.exclusive) {
@@ -498,15 +508,6 @@ function fmt_strip_tags(txt) {
         return "";
     }
     return ("" + txt).replace(/<(?:.|\n)*?>/gm, '');
-}
-
-function fmt_escape_feature(txt) {
-    // Exclude SAC which is the only boolean feature
-    if(txt === false) {
-        return undefined;
-    } else {
-        return fmt_escape_html0(txt).replace(/\n/g, '<br/>');
-    }
 }
 
 function fmt_escape_html(txt) {
