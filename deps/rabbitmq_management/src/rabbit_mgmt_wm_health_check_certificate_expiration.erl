@@ -112,7 +112,7 @@ listener_expiring_within(#listener{node = Node, protocol = Protocol, ip_address 
         _ ->
             #{node => Node,
               protocol => Protocol,
-              interface => list_to_binary(inet:ntoa(Interface)),
+              interface => rabbit_data_coercion:to_utf8_binary(rabbit_misc:ntoa(Interface)),
               port => Port,
               certfile_expires_on => expires_on_list(CertfileExpiresOn),
               cacertfile_expires_on => expires_on_list(CacertfileExpiresOn)

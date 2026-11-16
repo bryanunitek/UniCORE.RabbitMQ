@@ -6,7 +6,6 @@
 %%
 
 -module(rabbit_quorum_queue).
--feature(maybe_expr, enable).
 
 -behaviour(rabbit_queue_type).
 -behaviour(rabbit_queue_type_ra).
@@ -70,7 +69,8 @@
          wal_force_roll_over/1]).
 -export([notify_decorators/1,
          notify_decorators/3,
-         spawn_notify_decorators/3]).
+         spawn_notify_decorators/3,
+         has_decorators/1]).
 
 -export([is_enabled/0,
          is_compatible/3,
@@ -110,6 +110,7 @@
 
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include("amqqueue.hrl").
+-include("mc.hrl").
 -include_lib("kernel/include/logger.hrl").
 
 -rabbit_boot_step(
@@ -199,6 +200,12 @@
      {mfa, {rabbit_registry, register,
             [policy_merge_strategy, <<"target-group-size">>, ?MODULE]}},
      {mfa, {rabbit_registry, register,
+            [policy_validator, <<"member-placement-tag">>, ?MODULE]}},
+     {mfa, {rabbit_registry, register,
+            [operator_policy_validator, <<"member-placement-tag">>, ?MODULE]}},
+     {mfa, {rabbit_registry, register,
+            [policy_merge_strategy, <<"member-placement-tag">>, ?MODULE]}},
+     {mfa, {rabbit_registry, register,
             [policy_validator, <<"delayed-retry-type">>, ?MODULE]}},
      {mfa, {rabbit_registry, register,
             [policy_validator, <<"delayed-retry-min">>, ?MODULE]}},
@@ -245,6 +252,11 @@ validate_policy0(<<"target-group-size">>, Value) ->
         true  -> ok;
         false -> {error, "~tp is not a valid qq target count value", [Value]}
     end;
+validate_policy0(<<"member-placement-tag">>, Value)
+  when is_binary(Value), byte_size(Value) > 0 ->
+    ok;
+validate_policy0(<<"member-placement-tag">>, Value) ->
+    {error, "~tp is not a valid member-placement-tag value. Must be a non-empty string", [Value]};
 validate_policy0(<<"delayed-retry-type">>, <<"all">>)      -> ok;
 validate_policy0(<<"delayed-retry-type">>, <<"failed">>)   -> ok;
 validate_policy0(<<"delayed-retry-type">>, <<"returned">>) -> ok;
@@ -264,6 +276,8 @@ validate_policy0(<<"delayed-retry-max">>, Value) ->
 
 merge_policy_value(<<"target-group-size">>, Val, OpVal) ->
     max(Val, OpVal);
+merge_policy_value(<<"member-placement-tag">>, _Val, OpVal) ->
+    OpVal;
 merge_policy_value(<<"delayed-retry-type">>, _Val, OpVal) ->
     OpVal;
 merge_policy_value(<<"delayed-retry-min">>, Val, OpVal) ->
@@ -631,6 +645,7 @@ capabilities() ->
                           <<"x-single-active-consumer">>,
                           <<"x-queue-type">>,
                           <<"x-quorum-initial-group-size">>,
+                          <<"x-member-placement-tag">>,
                           <<"x-delivery-limit">>,
                           <<"x-message-ttl">>,
                           <<"x-queue-leader-locator">>,
@@ -645,7 +660,8 @@ capabilities() ->
       rebalance_module => ?MODULE,
       can_redeliver => true,
       is_replicable => true,
-      distribution_modes => [move]
+      distribution_modes => [move],
+      amqp_link_capabilities => [<<"rabbitmq:deferral-tokens">>]
      }.
 
 rpc_delete_metrics(QName) ->
@@ -1347,7 +1363,8 @@ deliver0(QName, Correlation, Msg, QState0) ->
 
 deliver(QSs, Msg0, Options) ->
     Correlation = maps:get(correlation, Options, undefined),
-    Msg = mc:prepare(store, Msg0),
+    Msg1 = annotate_delivery_time(Msg0),
+    Msg = mc:prepare(store, Msg1),
     lists:foldl(
       fun({Q, stateless}, Acc) ->
               QRef = amqqueue:get_pid(Q),
@@ -1423,15 +1440,11 @@ retry_delayed(Q, Mode) when ?is_amqqueue(Q) ->
     Server = amqqueue:get_pid(Q),
     rabbit_fifo_client:retry_delayed(Server, Mode).
 
--spec assign_deferred(rabbit_types:ctag(), [binary()],
-                      rabbit_fifo_client:state(),
-                      amqqueue:amqqueue()) ->
-    {{ok, non_neg_integer()} |
-     {partial, non_neg_integer(), [binary()]} |
-     {error, term()},
-     rabbit_fifo_client:state()}.
-assign_deferred(CTag, Tokens, QState, _Q) ->
-    rabbit_fifo_client:assign_deferred(CTag, Tokens, QState).
+-spec assign_deferred(rabbit_amqqueue:name(), rabbit_types:ctag(), [binary()],
+                      rabbit_fifo_client:state()) ->
+    {rabbit_fifo_client:state(), rabbit_queue_type:actions()}.
+assign_deferred(_QName, CTag, Tokens, QState) ->
+    rabbit_fifo_client:assign_deferred(quorum_ctag(CTag), Tokens, QState).
 
 cleanup_data_dir() ->
     Names = [begin
@@ -1513,59 +1526,73 @@ status(#resource{virtual_host = Vhost, name = QueueName}) ->
 status(Q) when ?amqqueue_is_quorum(Q) ->
     {RName, _} = amqqueue:get_pid(Q),
     Nodes = lists:sort(get_nodes(Q)),
+    TagKey = rabbit_queue_location:placement_tag_key(Q),
+    NodeToAZ = case TagKey of
+                   undefined -> #{};
+                   Key       -> rabbit_member_placement_az:node_tags_for_nodes(Nodes, Key)
+               end,
     [begin
          ServerId = {RName, N},
-         case erpc_call(N, ?MODULE, key_metrics_rpc, [ServerId], ?RPC_TIMEOUT) of
-             #{state := RaftState,
-               membership := Membership,
-               commit_index := Commit,
-               term := Term,
-               last_index := Last,
-               last_applied := LastApplied,
-               last_written_index := LastWritten,
-               snapshot_index := SnapIdx,
-               machine_version := MacVer} ->
-                 [{<<"Node Name">>, N},
-                  {<<"Raft State">>, RaftState},
-                  {<<"Membership">>, Membership},
-                  {<<"Last Log Index">>, Last},
-                  {<<"Last Written">>, LastWritten},
-                  {<<"Last Applied">>, LastApplied},
-                  {<<"Commit Index">>, Commit},
-                  {<<"Snapshot Index">>, SnapIdx},
-                  {<<"Term">>, Term},
-                  {<<"Machine Version">>, MacVer}
-                 ];
-             #{state := noproc,
-               membership := unknown,
-               machine_version := MacVer} ->
-                 [{<<"Node Name">>, N},
-                  {<<"Raft State">>, noproc},
-                  {<<"Membership">>, <<>>},
-                  {<<"Last Log Index">>, <<>>},
-                  {<<"Last Written">>, <<>>},
-                  {<<"Last Applied">>, <<>>},
-                  {<<"Commit Index">>, <<>>},
-                  {<<"Snapshot Index">>, <<>>},
-                  {<<"Term">>, <<>>},
-                  {<<"Machine Version">>, MacVer}
-                 ];
-             {error, Reason} ->
-                 State = case is_atom(Reason) of
-                             true -> Reason;
-                             false -> unknown
-                         end,
-                 [{<<"Node Name">>, N},
-                  {<<"Raft State">>, State},
-                  {<<"Membership">>, <<>>},
-                  {<<"Last Log Index">>, <<>>},
-                  {<<"Last Written">>, <<>>},
-                  {<<"Last Applied">>, <<>>},
-                  {<<"Commit Index">>, <<>>},
-                  {<<"Snapshot Index">>, <<>>},
-                  {<<"Term">>, <<>>},
-                  {<<"Machine Version">>, <<>>}
-                 ]
+         BaseRow = case erpc_call(N, ?MODULE, key_metrics_rpc, [ServerId], ?RPC_TIMEOUT) of
+                       #{state := RaftState,
+                         membership := Membership,
+                         commit_index := Commit,
+                         term := Term,
+                         last_index := Last,
+                         last_applied := LastApplied,
+                         last_written_index := LastWritten,
+                         snapshot_index := SnapIdx,
+                         machine_version := MacVer} ->
+                           [{<<"Node Name">>, N},
+                            {<<"Raft State">>, RaftState},
+                            {<<"Membership">>, Membership},
+                            {<<"Last Log Index">>, Last},
+                            {<<"Last Written">>, LastWritten},
+                            {<<"Last Applied">>, LastApplied},
+                            {<<"Commit Index">>, Commit},
+                            {<<"Snapshot Index">>, SnapIdx},
+                            {<<"Term">>, Term},
+                            {<<"Machine Version">>, MacVer}
+                           ];
+                       #{state := noproc,
+                         membership := unknown,
+                         machine_version := MacVer} ->
+                           [{<<"Node Name">>, N},
+                            {<<"Raft State">>, noproc},
+                            {<<"Membership">>, <<>>},
+                            {<<"Last Log Index">>, <<>>},
+                            {<<"Last Written">>, <<>>},
+                            {<<"Last Applied">>, <<>>},
+                            {<<"Commit Index">>, <<>>},
+                            {<<"Snapshot Index">>, <<>>},
+                            {<<"Term">>, <<>>},
+                            {<<"Machine Version">>, MacVer}
+                           ];
+                       {error, Reason} ->
+                           State = case is_atom(Reason) of
+                                       true -> Reason;
+                                       false -> unknown
+                                   end,
+                           [{<<"Node Name">>, N},
+                            {<<"Raft State">>, State},
+                            {<<"Membership">>, <<>>},
+                            {<<"Last Log Index">>, <<>>},
+                            {<<"Last Written">>, <<>>},
+                            {<<"Last Applied">>, <<>>},
+                            {<<"Commit Index">>, <<>>},
+                            {<<"Snapshot Index">>, <<>>},
+                            {<<"Term">>, <<>>},
+                            {<<"Machine Version">>, <<>>}
+                           ]
+                   end,
+         case TagKey of
+             undefined -> BaseRow;
+             _ -> AZ = case maps:get(N, NodeToAZ, undefined) of
+                           undefined -> <<>>;
+                           Val -> Val
+                       end,
+                  [NodeName | Rest] = BaseRow,
+                  [NodeName, {<<"AZ">>, AZ} | Rest]
          end
      end || N <- Nodes].
 
@@ -2438,6 +2465,7 @@ make_ra_conf(Q, ServerId, TickTimeout,
 
 make_mutable_config(Q) ->
     QName = amqqueue:get_name(Q),
+    #resource{name = QNameBin} = QName,
     TickTimeout = application:get_env(rabbit, quorum_tick_interval,
                                       ?TICK_INTERVAL),
     MinRecoveryCheckpointInterval =
@@ -2446,7 +2474,9 @@ make_mutable_config(Q) ->
     Formatter = {?MODULE, format_ra_event, [QName]},
     #{tick_timeout => TickTimeout,
       min_recovery_checkpoint_interval => MinRecoveryCheckpointInterval,
-      ra_event_formatter => Formatter}.
+      ra_event_formatter => Formatter,
+      metrics_labels => #{vhost => amqqueue:get_vhost(Q),
+                          queue => QNameBin}}.
 
 get_nodes(Q) when ?is_amqqueue(Q) ->
     #{nodes := Nodes} = amqqueue:get_type_state(Q),
@@ -2496,6 +2526,15 @@ notify_decorators(QName, F, A) ->
             ok;
         {error, not_found} ->
             ok
+    end.
+
+-spec has_decorators(rabbit_amqqueue:name()) -> boolean().
+has_decorators(QName) ->
+    case rabbit_amqqueue:lookup(QName) of
+        {ok, Q} ->
+            rabbit_queue_decorator:select(amqqueue:get_decorators(Q)) =/= [];
+        {error, not_found} ->
+            false
     end.
 
 %% `ra_server_proc:force_shrink_members_to_current_member/1` typespec does
@@ -2895,3 +2934,29 @@ table_lookup(Tbl, Key, Default)
         _ ->
             Default
     end.
+
+annotate_delivery_time(Msg) ->
+    case mc:is(Msg) of
+        true ->
+            %% "When a message is being sent with a delivery delay
+            %% configured, a message annotation with symbol key of
+            %% “x-opt-delivery-time” is used to convey the earliest point
+            %% in time at which a message may be delivered to a
+            %% receiver by the peer. If the annotation is present its value
+            %% MUST be a timestamp or an equivalent value using an
+            %% integral numeric type such as long, representing the
+            %% delivery time as a number of milliseconds since the Unix Epoch."
+            %% [schdmsg-v1.0] § 2.1
+            case mc:x_header(<<"x-opt-delivery-time">>, Msg) of
+                {_Type, Ts} when is_integer(Ts) ->
+                    %% The queue will need to delay this message.
+                    %% add the dt annotation for easy access inside
+                    %% the queue
+                    mc:set_annotation(?ANN_DELIVERY_TIME, Ts, Msg);
+                _ ->
+                    Msg
+            end;
+        false ->
+            Msg
+    end.
+

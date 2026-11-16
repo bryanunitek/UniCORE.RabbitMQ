@@ -15,8 +15,6 @@
 
 -module(rabbit_stream_reader).
 
--feature(maybe_expr, enable).
-
 -behaviour(gen_statem).
 
 -include("rabbit_stream_utils.hrl").
@@ -562,10 +560,6 @@ transition_to_opened(Transport,
                      Configuration,
                      NewConnection,
                      NewConnectionState) ->
-    % TODO remove registration to rabbit_stream_connections
-    % just meant to be able to close the connection remotely
-    % should be possible once the connections are available in ctl list_connections
-    pg_local:join(rabbit_stream_connections, self()),
     Connection1 =
         rabbit_event:init_stats_timer(NewConnection,
                                       #stream_connection.stats_timer),

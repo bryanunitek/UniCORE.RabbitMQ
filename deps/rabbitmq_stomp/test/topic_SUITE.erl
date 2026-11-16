@@ -15,6 +15,14 @@
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 -include("rabbit_stomp.hrl").
 -include("rabbit_stomp_frame.hrl").
+
+-define(BINDING_EXCHANGE, <<"perm.test.exchange">>).
+-define(BINDING_KEY, <<"private.key">>).
+-define(BINDING_USER, <<"stomp-binding-user">>).
+-define(BINDING_PASS, <<"stomp-binding-pass">>).
+%% Native STOMP subscription queues are named with this prefix.
+-define(SUB_QUEUE_PATTERN, <<"^stomp-subscription.*">>).
+
 all() ->
     [{group, list_to_atom("version_" ++ V)} || V <- ?SUPPORTED_VERSIONS].
 
@@ -23,7 +31,10 @@ groups() ->
         publish_topic_authorisation,
         subscribe_topic_authorisation,
         publish_topic_authorisation_regex_not_injected,
-        change_default_topic_exchange
+        change_default_topic_exchange,
+        subscribe_exchange_authorisation_refused_without_read,
+        subscribe_exchange_authorisation_refused_without_write,
+        subscribe_exchange_authorisation_allowed
     ],
 
     [{list_to_atom("version_" ++ V), [sequence], Tests}
@@ -92,53 +103,53 @@ end_per_testcase0(Config) ->
 publish_topic_authorisation(Config) ->
     ClientFoo = ?config(client_foo, Config),
 
-    AuthorisedTopic = "/topic/user.AuthorisedTopic",
-    RestrictedTopic = "/topic/user.RestrictedTopic",
+    AuthorisedTopic = <<"/topic/user.AuthorisedTopic">>,
+    RestrictedTopic = <<"/topic/user.RestrictedTopic">>,
 
     %% send on authorised topic
     rabbit_stomp_client:send(
-        ClientFoo, "SUBSCRIBE", [{"destination", AuthorisedTopic},
-                                 {"id", "s0"},
-                                 {"durable", "true"}]),
+        ClientFoo, 'SUBSCRIBE', [{<<"destination">>, AuthorisedTopic},
+                                  {<<"id">>, <<"s0">>},
+                                  {<<"durable">>, <<"true">>}]),
 
     rabbit_stomp_client:send(
-        ClientFoo, "SEND", [{"destination", AuthorisedTopic}], ["authorised hello"]),
+        ClientFoo, 'SEND', [{<<"destination">>, AuthorisedTopic}], ["authorised hello"]),
 
-    {ok, _Client1, _, Body} = stomp_receive(ClientFoo, "MESSAGE"),
+    {ok, _Client1, _, Body} = stomp_receive(ClientFoo, 'MESSAGE'),
     [<<"authorised hello">>] = Body,
 
     %% send on restricted topic
     rabbit_stomp_client:send(
-      ClientFoo, "SEND", [{"destination", RestrictedTopic}], ["hello"]),
-    {ok, _Client2, Hdrs2, _} = stomp_receive(ClientFoo, "ERROR"),
-    "access_refused" = proplists:get_value("message", Hdrs2),
+      ClientFoo, 'SEND', [{<<"destination">>, RestrictedTopic}], ["hello"]),
+    {ok, _Client2, Hdrs2, _} = stomp_receive(ClientFoo, 'ERROR'),
+    <<"access_refused">> = maps:get(<<"message">>, Hdrs2),
     ok.
 
 subscribe_topic_authorisation(Config) ->
     ClientFoo = ?config(client_foo, Config),
 
-    AuthorisedTopic = "/topic/user.AuthorisedTopic",
-    RestrictedTopic = "/topic/user.RestrictedTopic",
+    AuthorisedTopic = <<"/topic/user.AuthorisedTopic">>,
+    RestrictedTopic = <<"/topic/user.RestrictedTopic">>,
 
     %% subscribe to authorised topic
     rabbit_stomp_client:send(
-        ClientFoo, "SUBSCRIBE", [{"destination", AuthorisedTopic},
-                                 {"id", "s0"},
-                                 {"durable", "true"}]),
+        ClientFoo, 'SUBSCRIBE', [{<<"destination">>, AuthorisedTopic},
+                                  {<<"id">>, <<"s0">>},
+                                  {<<"durable">>, <<"true">>}]),
 
     rabbit_stomp_client:send(
-        ClientFoo, "SEND", [{"destination", AuthorisedTopic}], ["authorised hello"]),
+        ClientFoo, 'SEND', [{<<"destination">>, AuthorisedTopic}], ["authorised hello"]),
 
-    {ok, _Client1, _, Body} = stomp_receive(ClientFoo, "MESSAGE"),
+    {ok, _Client1, _, Body} = stomp_receive(ClientFoo, 'MESSAGE'),
     [<<"authorised hello">>] = Body,
 
     %% subscribe to restricted topic
     rabbit_stomp_client:send(
-        ClientFoo, "SUBSCRIBE", [{"destination", RestrictedTopic},
-                                 {"id", "s1"},
-                                 {"durable", "true"}]),
-    {ok, _Client2, Hdrs2, _} = stomp_receive(ClientFoo, "ERROR"),
-    "access_refused" = proplists:get_value("message", Hdrs2),
+        ClientFoo, 'SUBSCRIBE', [{<<"destination">>, RestrictedTopic},
+                                  {<<"id">>, <<"s1">>},
+                                  {<<"durable">>, <<"true">>}]),
+    {ok, _Client2, Hdrs2, _} = stomp_receive(ClientFoo, 'ERROR'),
+    <<"access_refused">> = maps:get(<<"message">>, Hdrs2),
     ok.
 
 publish_topic_authorisation_regex_not_injected(Config) ->
@@ -155,18 +166,18 @@ publish_topic_authorisation_regex_not_injected(Config) ->
     {ok, ClientRegex} = rabbit_stomp_client:connect(Version, ".*", "pass", StompPort),
 
     rabbit_stomp_client:send(
-        ClientRegex, "SUBSCRIBE", [{"destination", "/topic/.*.Authorised"},
-                                   {"id", "s0"},
-                                   {"durable", "true"}]),
+        ClientRegex, 'SUBSCRIBE', [{<<"destination">>, <<"/topic/.*.Authorised">>},
+                                    {<<"id">>, <<"s0">>},
+                                    {<<"durable">>, <<"true">>}]),
     rabbit_stomp_client:send(
-        ClientRegex, "SEND", [{"destination", "/topic/.*.Authorised"}], ["allowed"]),
-    {ok, _Client1, _, Body} = stomp_receive(ClientRegex, "MESSAGE"),
+        ClientRegex, 'SEND', [{<<"destination">>, <<"/topic/.*.Authorised">>}], ["allowed"]),
+    {ok, _Client1, _, Body} = stomp_receive(ClientRegex, 'MESSAGE'),
     [<<"allowed">>] = Body,
 
     rabbit_stomp_client:send(
-        ClientRegex, "SEND", [{"destination", "/topic/injected.Authorised"}], ["denied"]),
-    {ok, _Client2, Hdrs2, _} = stomp_receive(ClientRegex, "ERROR"),
-    "access_refused" = proplists:get_value("message", Hdrs2),
+        ClientRegex, 'SEND', [{<<"destination">>, <<"/topic/injected.Authorised">>}], ["denied"]),
+    {ok, _Client2, Hdrs2, _} = stomp_receive(ClientRegex, 'ERROR'),
+    <<"access_refused">> = maps:get(<<"message">>, Hdrs2),
 
     rabbit_stomp_client:disconnect(ClientRegex),
     rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_auth_backend_internal, delete_user,
@@ -180,7 +191,7 @@ change_default_topic_exchange(Config) ->
     Ex = <<"my-topic-exchange">>,
     ok = rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env, [rabbitmq_stomp, default_topic_exchange, Ex]),
     {ok, ClientFoo} = rabbit_stomp_client:connect(Version, StompPort),
-    AuthorisedTopic = "/topic/user.AuthorisedTopic",
+    AuthorisedTopic = <<"/topic/user.AuthorisedTopic">>,
 
     Declare = #'exchange.declare'{exchange = Ex, type = <<"topic">>},
     #'exchange.declare_ok'{} = amqp_channel:call(Channel, Declare),
@@ -188,9 +199,9 @@ change_default_topic_exchange(Config) ->
     0 = length(rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_binding, list_for_source, [#resource{virtual_host= <<"/">>, kind = exchange, name = Ex}])),
 
     rabbit_stomp_client:send(
-        ClientFoo, "SUBSCRIBE", [{"destination", AuthorisedTopic},
-                                 {"id", "s0"},
-                                 {"durable", "true"}]),
+        ClientFoo, 'SUBSCRIBE', [{<<"destination">>, AuthorisedTopic},
+                                  {<<"id">>, <<"s0">>},
+                                  {<<"durable">>, <<"true">>}]),
 
     %% STOMP SUBSCRIBE creates the binding asynchronously; wait for it
     %% to be readable (as in consistency).
@@ -201,9 +212,9 @@ change_default_topic_exchange(Config) ->
                 30_000),
 
     rabbit_stomp_client:send(
-        ClientFoo, "SEND", [{"destination", AuthorisedTopic}], ["ohai there"]),
+        ClientFoo, 'SEND', [{<<"destination">>, AuthorisedTopic}], ["ohai there"]),
 
-    {ok, _Client1, _, Body} = stomp_receive(ClientFoo, "MESSAGE"),
+    {ok, _Client1, _, Body} = stomp_receive(ClientFoo, 'MESSAGE'),
     [<<"ohai there">>] = Body,
 
     Delete = #'exchange.delete'{exchange = Ex},
@@ -213,10 +224,83 @@ change_default_topic_exchange(Config) ->
     ok.
 
 
+%% Subscribing to /exchange/<exchange>/<key> creates a binding, so it must be
+%% authorised like `queue.bind`.
+
+%% The user can configure, write and read its own subscription queues but has no
+%% read on the source exchange.
+subscribe_exchange_authorisation_refused_without_read(Config) ->
+    binding_authorisation_refused(Config, ?SUB_QUEUE_PATTERN, ?SUB_QUEUE_PATTERN,
+                                  ?SUB_QUEUE_PATTERN).
+
+%% The user can read the source exchange but cannot write to its subscription queue.
+subscribe_exchange_authorisation_refused_without_write(Config) ->
+    binding_authorisation_refused(Config, <<".*">>, <<"^$">>, <<".*">>).
+
+subscribe_exchange_authorisation_allowed(Config) ->
+    Channel = ?config(amqp_channel, Config),
+    with_binding_user(
+      Config, <<".*">>, <<".*">>, <<".*">>,
+      fun(Client) ->
+              subscribe_to_binding_exchange(Client),
+              ?awaitMatch([_], binding_exchange_bindings(Config), 30_000),
+              amqp_channel:cast(
+                Channel,
+                #'basic.publish'{exchange = ?BINDING_EXCHANGE, routing_key = ?BINDING_KEY},
+                #amqp_msg{payload = <<"secret-message">>}),
+              {ok, _Client1, _Hdrs, Body} = stomp_receive(Client, 'MESSAGE'),
+              [<<"secret-message">>] = Body
+      end).
+
+binding_authorisation_refused(Config, Configure, Write, Read) ->
+    with_binding_user(
+      Config, Configure, Write, Read,
+      fun(Client) ->
+              subscribe_to_binding_exchange(Client),
+              {ok, _Client1, Hdrs, _Body} = stomp_receive(Client, 'ERROR'),
+              <<"access_refused">> = maps:get(<<"message">>, Hdrs),
+              [] = binding_exchange_bindings(Config)
+      end).
+
+%% Runs Fun with a STOMP client for a restricted user that has the given
+%% configure, write and read permissions, and cleans up afterwards.
+with_binding_user(Config, Configure, Write, Read, Fun) ->
+    Channel = ?config(amqp_channel, Config),
+    Version = ?config(version, Config),
+    StompPort = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_stomp),
+    #'exchange.declare_ok'{} =
+        amqp_channel:call(Channel, #'exchange.declare'{exchange = ?BINDING_EXCHANGE,
+                                                       type = <<"direct">>}),
+    rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_auth_backend_internal, add_user,
+                                 [?BINDING_USER, ?BINDING_PASS, <<"acting-user">>]),
+    rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_auth_backend_internal, set_permissions,
+                                 [?BINDING_USER, <<"/">>, Configure, Write, Read,
+                                  <<"acting-user">>]),
+    {ok, Client} = rabbit_stomp_client:connect(Version, binary_to_list(?BINDING_USER),
+                                               binary_to_list(?BINDING_PASS), StompPort),
+    try
+        Fun(Client)
+    after
+        rabbit_stomp_client:disconnect(Client),
+        rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_auth_backend_internal, delete_user,
+                                     [?BINDING_USER, <<"acting-user">>]),
+        amqp_channel:call(Channel, #'exchange.delete'{exchange = ?BINDING_EXCHANGE})
+    end.
+
+subscribe_to_binding_exchange(Client) ->
+    Destination = <<"/exchange/", ?BINDING_EXCHANGE/binary, "/", ?BINDING_KEY/binary>>,
+    rabbit_stomp_client:send(
+      Client, 'SUBSCRIBE', [{<<"destination">>, Destination},
+                            {<<"id">>, <<"binding-sub">>}]).
+
+binding_exchange_bindings(Config) ->
+    rabbit_ct_broker_helpers:rpc(
+      Config, 0, rabbit_binding, list_for_source,
+      [#resource{virtual_host = <<"/">>, kind = exchange, name = ?BINDING_EXCHANGE}]).
+
 stomp_receive(Client, Command) ->
     {#stomp_frame{command     = Command,
         headers     = Hdrs,
-        body_iolist = Body},   Client1} =
+        body_iolist_rev = Body},   Client1} =
         rabbit_stomp_client:recv(Client),
     {ok, Client1, Hdrs, Body}.
-

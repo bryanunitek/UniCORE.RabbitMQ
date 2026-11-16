@@ -164,6 +164,7 @@ all_tests() ->
      relaxed_argument_equivalence_checks_on_qq_redeclare,
      consume_invalid_arg_1,
      consume_invalid_arg_2,
+     decorator_added_to_idle_queue_is_notified,
      consume_invalid_consumer_timeout_negative,
      consume_invalid_consumer_timeout_wrong_type,
      start_queue,
@@ -245,7 +246,10 @@ all_tests() ->
      delayed_retry_returned,
      delayed_retry_backoff,
      delayed_retry_explicit_delivery_time,
-     delayed_retry_counts_towards_limit
+     delayed_retry_counts_towards_limit,
+     delivery_time_counts_towards_limit,
+     delivery_time_on_publish,
+     delivery_time_on_publish_amqpl
     ].
 
 memory_tests() ->
@@ -422,6 +426,8 @@ init_per_testcase(Testcase, Config) ->
             {skip, "reclaim_memory_with_wrong_queue_type isn't mixed versions compatible"};
         peek_with_wrong_queue_type when IsMixed ->
             {skip, "peek_with_wrong_queue_type isn't mixed versions compatible"};
+        decorator_added_to_idle_queue_is_notified when IsMixed ->
+            {skip, "decorator_added_to_idle_queue_is_notified isn't mixed versions compatible"};
         _ ->
             Config1 = rabbit_ct_helpers:testcase_started(Config, Testcase),
             rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_queues, []),
@@ -447,6 +453,16 @@ end_per_testcase(Testcase, Config) when Testcase == partitioned_publisher;
     Config1 = rabbit_ct_helpers:run_steps(Config,
       rabbit_ct_client_helpers:teardown_steps() ++
       rabbit_ct_broker_helpers:teardown_steps()),
+    rabbit_ct_helpers:testcase_finished(Config1, Testcase);
+end_per_testcase(decorator_added_to_idle_queue_is_notified = Testcase,
+                 Config) ->
+    _ = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_queue_decorator,
+                                     unregister, [<<"dummy">>]),
+    _ = rabbit_ct_broker_helpers:rpc_all(Config, dummy_queue_decorator,
+                                         clear_target, []),
+    Config1 = rabbit_ct_helpers:run_steps(
+                Config,
+                rabbit_ct_client_helpers:teardown_steps()),
     rabbit_ct_helpers:testcase_finished(Config1, Testcase);
 end_per_testcase(Testcase, Config) ->
     % catch delete_queues(),
@@ -645,6 +661,27 @@ consume_invalid_arg_2(Config) ->
                                      no_ack = false,
                                      consumer_tag = <<"ctag">>},
                               self())).
+
+decorator_added_to_idle_queue_is_notified(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+    QName = rabbit_misc:r(<<"/">>, queue, Q),
+    subscribe(Ch, Q, false),
+    _ = rabbit_ct_broker_helpers:rpc_all(Config, dummy_queue_decorator,
+                                         set_target, [QName, self()]),
+    %% `rabbit_queue_decorator:register/2` updates the queue record but
+    %% applies no command to the queue, so only a tick can notify the decorator.
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_queue_decorator,
+                                      register, [<<"dummy">>, dummy_queue_decorator]),
+    receive
+        {dummy_queue_decorator, QName, MaxActivePriority, IsEmpty} ->
+            ?assertEqual({0, true}, {MaxActivePriority, IsEmpty})
+    after 30_000 ->
+            ct:fail(decorator_not_notified)
+    end.
 
 consume_invalid_consumer_timeout_negative(Config) ->
     Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
@@ -1903,8 +1940,8 @@ recovery_checkpoint(Config) ->
         %% Verify state was recovered correctly by checking message count on both
         %% the leader and the restarted follower.
         ?awaitMatch({ok, {_, #{num_messages := N}}, _},
-                    rpc:call(Server0, ra, local_query,
-                             [{RaName, Server0}, fun rabbit_fifo:overview/1]),
+                    rpc:call(Server0, rabbit_fifo_client, local_query,
+                             [{RaName, Server0}, overview]),
                     10000),
         ?awaitMatch({ok, {_, #{num_messages := N}}, _},
                     rpc:call(Server1, ra, local_query,
@@ -3056,8 +3093,17 @@ cleanup_queue_state_on_channel_after_publish(Config) ->
     [NCh1, NCh2] = rpc:call(Server, rabbit_channel, list, []) -- ChsBefore,
     %% Check the channel state contains the state for the quorum queue on
     %% channel 1 and 2
-    wait_for_cleanup(Server, NCh1, 0),
-    wait_for_cleanup(Server, NCh2, 1),
+    %% Note: pg:get_local_members doesn't guarantee order, so we need to identify
+    %% which channel has queue state
+    {ChWithoutState, ChWithState} = case length(rpc:call(Server,
+                                                         rabbit_channel,
+                                                         list_queue_states,
+                                                         [NCh1])) of
+        0 -> {NCh1, NCh2};
+        1 -> {NCh2, NCh1}
+    end,
+    wait_for_cleanup(Server, ChWithoutState, 0),
+    wait_for_cleanup(Server, ChWithState, 1),
     %% then delete the queue and wait for the process to terminate
     ?assertMatch(#'queue.delete_ok'{},
                  amqp_channel:call(Ch1, #'queue.delete'{queue = QQ})),
@@ -3067,8 +3113,8 @@ cleanup_queue_state_on_channel_after_publish(Config) ->
                                           [?SUPNAME]))
       end, 30000),
     %% Check that all queue states have been cleaned
-    wait_for_cleanup(Server, NCh2, 0),
-    wait_for_cleanup(Server, NCh1, 0).
+    wait_for_cleanup(Server, ChWithState, 0),
+    wait_for_cleanup(Server, ChWithoutState, 0).
 
 cleanup_queue_state_on_channel_after_subscribe(Config) ->
     %% Declare/delete the queue and publish in one channel, while consuming on a
@@ -4802,7 +4848,8 @@ purge(Config) ->
 
     {'queue.purge_ok', 2} = amqp_channel:call(Ch, #'queue.purge'{queue = QQ}),
 
-    ?assertEqual([0], dirty_query([Server], RaName, fun rabbit_fifo:query_messages_total/1)).
+    ?assertMatch(#{num_messages := 0},  machine_overview({RaName, Server})),
+    ok.
 
 peek(Config) ->
     [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
@@ -5608,8 +5655,8 @@ amqpl_headers(Config) ->
      #amqp_msg{props = #'P_basic'{headers = Headers2Received}}
     } = amqp_channel:call(Ch, #'basic.get'{queue = QQ}),
 
-    ?assertEqual(Headers1Sent, Headers1Received),
-    ?assertEqual(Headers2Sent, Headers2Received),
+    ?assertEqual(undefined, Headers1Received),
+    ?assertEqual([], Headers2Received),
 
     ok = amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag,
                                             multiple = true}).
@@ -6609,6 +6656,76 @@ delayed_retry_explicit_delivery_time(Config) ->
     ok = detach_link_sync(Receiver),
     ok = close(Init).
 
+delivery_time_on_publish(Config) ->
+    check_quorum_queues_v9_compat(Config),
+    %% Test that a message published with an x-opt-delivery-time annotation
+    %% is not delivered before that time, even on its very first delivery.
+    {_Connection, Session, LinkPair} = Init = init(Config),
+    QQ = ?config(queue_name, Config),
+    Addr = rabbitmq_amqp_address:queue(QQ),
+    {ok, _} = rabbitmq_amqp_client:declare_queue(
+                LinkPair, QQ,
+                #{arguments => #{<<"x-queue-type">> => {utf8, <<"quorum">>}}}),
+    {ok, Sender} = amqp10_client:attach_sender_link(Session, <<"sender">>, Addr),
+    ok = wait_for_credit(Sender),
+
+    Now = erlang:system_time(millisecond),
+    DeliveryTime = Now + 5000,
+    Msg = amqp10_msg:set_message_annotations(
+            #{<<"x-opt-delivery-time">> => DeliveryTime},
+            amqp10_msg:new(<<"t1">>, <<"m1">>)),
+    ok = amqp10_client:send_msg(Sender, Msg),
+    ok = wait_for_accepts(1),
+    ok = detach_link_sync(Sender),
+
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"receiver">>, Addr, unsettled),
+    %% Message should NOT be delivered before its delivery time.
+    ok = amqp10_client:flow_link_credit(Receiver, 1, never, false),
+    receive {amqp10_msg, Receiver, _} ->
+                ct:fail(message_should_be_delayed)
+    after 1000 -> ok
+    end,
+    %% Once the delivery time has passed, the message should be delivered.
+    receive {amqp10_msg, Receiver, _M1} -> ok
+    after 5000 ->
+              flush(1),
+              ct:fail({missing_msg, ?LINE})
+    end,
+    ok = detach_link_sync(Receiver),
+    ok = close(Init).
+
+delivery_time_on_publish_amqpl(Config) ->
+    check_quorum_queues_v9_compat(Config),
+    %% Same as delivery_time_on_publish but for AMQP 0-9-1: a message
+    %% published with an x-opt-delivery-time header is not delivered before
+    %% that time, even on its very first delivery.
+    [Server | _] = Servers = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    RaName = ra_name(QQ),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+
+    Now = erlang:system_time(millisecond),
+    DeliveryTime = Now + 5000,
+    ok = amqp_channel:cast(
+           Ch,
+           #'basic.publish'{routing_key = QQ},
+           #amqp_msg{props = #'P_basic'{
+                                headers = [{<<"x-opt-delivery-time">>, long, DeliveryTime}],
+                                delivery_mode = 2},
+                     payload = <<"msg">>}),
+    wait_for_messages_total(Servers, RaName, 1),
+    %% Message should NOT be ready before its delivery time.
+    consume_empty(Ch, QQ, false),
+    %% Once the delivery time has passed, the message should be delivered.
+    wait_for_messages_ready(Servers, RaName, 1),
+    DeliveryTag = basic_get_tag(Ch, QQ, false),
+    ok = amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag,
+                                            multiple = false}),
+    ok.
+
 delayed_retry_counts_towards_limit(Config) ->
     check_quorum_queues_v8_compat(Config),
     %% Test that delayed messages count towards max-length limit.
@@ -6645,6 +6762,43 @@ delayed_retry_counts_towards_limit(Config) ->
     wait_for_messages_total(Servers, RaName, 3),
     %% Fourth message should be rejected (limit exceeded + overshoot exhausted)
     fail = publish_confirm(Ch, QQ),
+    ok.
+
+delivery_time_counts_towards_limit(Config) ->
+    check_quorum_queues_v9_compat(Config),
+    %% Messages parked by x-opt-delivery-time count towards max-length, and
+    %% drop-head can reach them. Before it could not, so an overshoot made up
+    %% entirely of parked messages left apply/3 spinning and every member of
+    %% the queue hung on the same command.
+    [Server | _] = Servers =
+        rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    QQ = ?config(queue_name, Config),
+    RaName = ra_name(QQ),
+    ?assertEqual({'queue.declare_ok', QQ, 0, 0},
+                 declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-max-length">>, long, 1},
+                                  {<<"x-overflow">>, longstr, <<"drop-head">>}])),
+
+    DeliveryTime = erlang:system_time(millisecond) + 3_600_000,
+    Publish = fun() ->
+                      ok = amqp_channel:cast(
+                             Ch,
+                             #'basic.publish'{routing_key = QQ},
+                             #amqp_msg{props = #'P_basic'{
+                                                  headers =
+                                                      [{<<"x-opt-delivery-time">>,
+                                                        long, DeliveryTime}],
+                                                  delivery_mode = 2},
+                                       payload = <<"msg">>})
+              end,
+    [Publish() || _ <- lists:seq(1, 3)],
+    %% The queue settles at the limit rather than hanging. This query goes
+    %% through the Ra server process, so it also proves the machine is still
+    %% applying commands.
+    wait_for_messages_total(Servers, RaName, 1),
+    %% None of them are ready, they are all parked until their delivery time
+    consume_empty(Ch, QQ, false),
     ok.
 
 %% Helper functions
@@ -6803,9 +6957,19 @@ basic_get(Ch, Q, NoAck, Attempt) ->
     end.
 
 check_quorum_queues_v8_compat(Config) ->
+    check_quorum_queues_vn_compat(8, Config).
+
+check_quorum_queues_v9_compat(Config) ->
+    check_quorum_queues_vn_compat(9, Config).
+
+min_mac_version(Config) ->
     Nodes = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
-    MacVer = lists:min([V || {ok, V} <- erpc:multicall(Nodes, rabbit_fifo, version, [])]),
-    case MacVer >= 8 of
+    MacVer = lists:min([V || {ok, V} <-
+                             erpc:multicall(Nodes, rabbit_fifo, version, [])]),
+    MacVer.
+
+check_quorum_queues_vn_compat(Version, Config) ->
+    case min_mac_version(Config) >= Version of
         true ->
             ok;
         false ->

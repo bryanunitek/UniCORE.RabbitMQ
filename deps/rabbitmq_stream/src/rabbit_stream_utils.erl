@@ -16,8 +16,6 @@
 
 -module(rabbit_stream_utils).
 
--feature(maybe_expr, enable).
-
 -define(MAX_SUPER_STREAM_PARTITIONS, 1000).
 
 -define(ENDPOINT_TIMEOUT, 10_000).

@@ -36,7 +36,8 @@
          ranch_ref/1, ranch_ref/2, ranch_refs_of_protocol/1, ranch_ref_to_protocol/1,
          listener_ip_addresses/1, listener_per_ip_address/1,
          listeners_of_protocol/1, stop_ranch_listeners_of_protocol/1,
-         list_local_connections_of_protocol/1]).
+         list_local_connections_of_protocol/1,
+         ensure_listeners/3]).
 
 %% Used by TCP-based transports, e.g. STOMP adapter
 -export([tcp_listener_addresses/1,
@@ -83,8 +84,9 @@
 -type family() :: atom().
 -type listener_config() :: ip_port() |
                            {hostname(), ip_port()} |
-                           {hostname(), ip_port(), family()}.
--type address() :: {inet:ip_address(), ip_port(), family()}.
+                           {hostname(), ip_port(), family()} |
+                           {local, string(), ip_port()}.
+-type address() :: {inet:ip_address() | {local, string()}, ip_port(), family()}.
 -type name_prefix() :: atom().
 -type protocol() :: atom().
 -type label() :: string().
@@ -158,6 +160,8 @@ fix_ssl_options(Config) ->
 
 -spec tcp_listener_addresses(listener_config()) -> [address()].
 
+tcp_listener_addresses({local, Path, _Port}) ->
+    [{{local, Path}, 0, local}];
 tcp_listener_addresses(Port) when is_integer(Port) ->
     tcp_listener_addresses_auto(Port);
 tcp_listener_addresses({"auto", Port}) ->
@@ -243,6 +247,32 @@ listener_per_ip_address(Listener) ->
     [[{ip, IPAddress} | proplists:delete(ip, Listener)]
      || IPAddress <- listener_ip_addresses(Listener)].
 
+%% A later address failing to bind must not leave an earlier address's
+%% listener running and unrecorded: `Stop` undoes every address this call
+%% has started with `Start` before the failure is re-raised.
+-spec ensure_listeners([[{atom(), any()}], ...],
+                       fun(([{atom(), any()}]) -> new | existing | ignore),
+                       fun(([{atom(), any()}]) -> any())) ->
+    [new | existing | ignore].
+ensure_listeners(PerAddress, Start, Stop) ->
+    ensure_listeners(PerAddress, Start, Stop, [], []).
+
+ensure_listeners([], _Start, _Stop, _Started, Results) ->
+    lists:reverse(Results);
+ensure_listeners([Bound | Rest], Start, Stop, Started, Results) ->
+    try Start(Bound) of
+        Result ->
+            Started1 = case Result of
+                           new -> [Bound | Started];
+                           _   -> Started
+                       end,
+            ensure_listeners(Rest, Start, Stop, Started1, [Result | Results])
+    catch
+        Class:Reason:Stacktrace ->
+            _ = [Stop(B) || B <- Started],
+            erlang:raise(Class, Reason, Stacktrace)
+    end.
+
 -spec ranch_ref(inet:ip_address(), ip_port()) -> ranch:ref().
 
 %% Returns a reference that identifies a TCP listener in Ranch.
@@ -278,13 +308,19 @@ listeners_of_protocol(Protocol) ->
 
 -spec stop_ranch_listeners_of_protocol(atom()) -> ok.
 stop_ranch_listeners_of_protocol(Protocol) ->
-    case ranch_refs_of_protocol(Protocol) of
+    case listeners_of_protocol(Protocol) of
         [] ->
             ok;
-        Refs ->
+        Listeners ->
             ?LOG_DEBUG("Stopping Ranch listeners for protocol ~ts", [Protocol]),
-            lists:foreach(fun ranch:stop_listener/1, Refs)
+            lists:foreach(fun stop_ranch_listener/1, Listeners)
     end.
+
+-spec stop_ranch_listener(#listener{}) -> ok.
+stop_ranch_listener(Listener) ->
+    _ = ranch:stop_listener(ranch_ref(Listener)),
+    true = ets:delete_object(?ETS_TABLE, Listener),
+    ok.
 
 -spec list_local_connections_of_protocol(atom()) -> [pid()].
 list_local_connections_of_protocol(Protocol) ->
@@ -486,13 +522,18 @@ node_client_listeners(Node) ->
                          end, Xs)
     end.
 
+pg_scope_amqp091_connection() ->
+    rabbit:pg_scope_amqp091_connection().
+
 -spec register_connection(pid()) -> ok.
 
-register_connection(Pid) -> pg_local:join(rabbit_connections, Pid).
+register_connection(Pid) ->
+    pg:join(pg_scope_amqp091_connection(), Pid, Pid).
 
 -spec unregister_connection(pid()) -> ok.
-
-unregister_connection(Pid) -> pg_local:leave(rabbit_connections, Pid).
+unregister_connection(Pid) ->
+    _ = pg:leave(pg_scope_amqp091_connection(), Pid, Pid),
+    ok.
 
 -spec connections() -> [rabbit_types:connection()].
 connections() ->
@@ -501,17 +542,17 @@ connections() ->
 
 -spec local_connections() -> [rabbit_types:connection()].
 local_connections() ->
-    Amqp091Pids = pg_local:get_members(rabbit_connections),
-    Amqp10Pids = rabbit_amqp1_0:list_local(),
+    Amqp091Pids = pg:which_groups(pg_scope_amqp091_connection()),
+    Amqp10Pids = rabbit_amqp_reader:local_connections(),
     Amqp10Pids ++ Amqp091Pids.
 
 -spec register_non_amqp_connection(pid()) -> ok.
 
-register_non_amqp_connection(Pid) -> pg_local:join(rabbit_non_amqp_connections, Pid).
+register_non_amqp_connection(Pid) -> pg:join(rabbit:pg_scope_non_amqp_connection(), Pid, Pid).
 
 -spec unregister_non_amqp_connection(pid()) -> ok.
 
-unregister_non_amqp_connection(Pid) -> pg_local:leave(rabbit_non_amqp_connections, Pid).
+unregister_non_amqp_connection(Pid) -> pg:leave(rabbit:pg_scope_non_amqp_connection(), Pid, Pid).
 
 -spec non_amqp_connections() -> [rabbit_types:connection()].
 
@@ -521,7 +562,7 @@ non_amqp_connections() ->
 
 -spec local_non_amqp_connections() -> [rabbit_types:connection()].
 local_non_amqp_connections() ->
-  pg_local:get_members(rabbit_non_amqp_connections).
+  pg:which_local_groups(rabbit:pg_scope_non_amqp_connection()).
 
 -spec connection_info(rabbit_types:connection(), rabbit_types:info_keys()) ->
           rabbit_types:infos().
@@ -663,6 +704,8 @@ tune_buffer_size_static(Sock) ->
 
 %%--------------------------------------------------------------------
 
+tcp_host({local, Path}) ->
+    rabbit_misc:ntoab({local, Path});
 tcp_host(IPAddress) ->
     rabbit_net:tcp_host(IPAddress).
 

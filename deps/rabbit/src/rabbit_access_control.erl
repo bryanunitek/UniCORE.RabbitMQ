@@ -20,6 +20,10 @@
 -export([set_max_heap_size_unauthenticated/1,
          clear_max_heap_size/0]).
 
+-ifdef(TEST).
+-export([check_user_id0/2]).
+-endif.
+
 %%----------------------------------------------------------------------------
 
 -spec ensure_auth_backends_are_enabled() -> Ret when
@@ -304,7 +308,10 @@ check_user_loopback(Username, SockOrAddr) ->
 get_authz_data_from({ip, Address}) ->
     #{peeraddr => Address};
 get_authz_data_from({socket, Sock}) ->
-    {ok, {Address, _Port}} = rabbit_net:peername(Sock),
+    Address = case rabbit_net:peername(Sock) of
+                  {ok, {local, _} = Local} -> Local;
+                  {ok, {Addr, _Port}}      -> Addr
+              end,
     #{peeraddr => Address};
 get_authz_data_from(undefined) ->
     undefined.
@@ -329,7 +336,7 @@ check_vhost_access(User = #user{username       = Username,
                               auth_user(User, Impl), VHostPath, FullAuthzContext)
                 end,
                 Mod, "access to vhost '~ts' refused for user '~ts'",
-                [VHostPath, Username], not_allowed);
+                fun() -> [VHostPath, Username] end, not_allowed);
          (_, Else) ->
               Else
       end, ok, Modules).
@@ -360,7 +367,7 @@ check_resource_access(User = #user{username       = Username,
                 fun() -> Module:check_resource_access(
                            auth_user(User, Impl), Resource, Permission, Context) end,
                 Module, "~s access to ~ts refused for user '~ts'",
-                [Permission, rabbit_misc:rs(Resource), Username]);
+                fun() -> [Permission, rabbit_misc:rs(Resource), Username] end);
          (_, Else) -> Else
       end, ok, Modules).
 
@@ -373,26 +380,29 @@ check_topic_access(User = #user{username = Username,
                 fun() -> Module:check_topic_access(
                     auth_user(User, Impl), Resource, Permission, Context) end,
                 Module, "~s access to topic '~ts' in exchange ~ts refused for user '~ts'",
-                [Permission, maps:get(routing_key, Context), rabbit_misc:rs(Resource), Username]);
+                fun() ->
+                        [Permission, maps:get(routing_key, Context),
+                         rabbit_misc:rs(Resource), Username]
+                end);
             (_, Else) -> Else
         end, ok, Modules).
 
-check_access(Fun, Module, ErrStr, ErrArgs) ->
-    check_access(Fun, Module, ErrStr, ErrArgs, access_refused).
+check_access(Fun, Module, ErrStr, ErrArgsFun) ->
+    check_access(Fun, Module, ErrStr, ErrArgsFun, access_refused).
 
-check_access(Fun, Module, ErrStr, ErrArgs, ErrName) ->
+check_access(Fun, Module, ErrStr, ErrArgsFun, ErrName) ->
     case Fun() of
         true ->
             ok;
         false ->
-            rabbit_misc:protocol_error(ErrName, ErrStr, ErrArgs);
+            rabbit_misc:protocol_error(ErrName, ErrStr, ErrArgsFun());
         {false, Reason} ->
             FullErrStr = ErrStr ++ " by backend ~ts: ~ts",
-            FullErrArgs = ErrArgs ++ [Module, Reason],
+            FullErrArgs = ErrArgsFun() ++ [Module, Reason],
             rabbit_misc:protocol_error(ErrName, FullErrStr, FullErrArgs);
         {error, E}  ->
             FullErrStr = ErrStr ++ ", backend ~ts returned an error: ~tp",
-            FullErrArgs = ErrArgs ++ [Module, E],
+            FullErrArgs = ErrArgsFun() ++ [Module, E],
             ?LOG_ERROR(FullErrStr, FullErrArgs),
             rabbit_misc:protocol_error(ErrName, FullErrStr, FullErrArgs)
     end.
@@ -413,7 +423,8 @@ check_user_id0(_, #user{authz_backends = [{rabbit_auth_backend_dummy, _}]}) ->
     ok;
 check_user_id0(ClaimedUserName, #user{username = ActualUserName,
                                       tags = Tags}) ->
-    case lists:member(impersonator, Tags) of
+    TagsBin = [rabbit_data_coercion:to_binary(T) || T <- Tags],
+    case lists:member(<<"impersonator">>, TagsBin) of
         true ->
             ok;
         false ->

@@ -211,8 +211,8 @@
                  {bad_edge, [digraph:vertex()]}),
                 digraph:vertex(), digraph:vertex()}).
 -spec const(A) -> thunk(A).
--spec ntoa(inet:ip_address()) -> string().
--spec ntoab(inet:ip_address()) -> string().
+-spec ntoa(any()) -> string() | {error, einval}.
+-spec ntoab(any()) -> string() | binary().
 -spec is_process_alive(pid()) -> boolean().
 
 -spec pmerge(term(), term(), [term()]) -> [term()].
@@ -490,7 +490,7 @@ ensure_ok({error, Reason}, ErrorTag) -> throw({error, {ErrorTag, Reason}}).
 tcp_name(Prefix, IPAddress, Port)
   when is_atom(Prefix) andalso is_number(Port) ->
     list_to_atom(
-      format("~w_~ts:~w", [Prefix, inet_parse:ntoa(IPAddress), Port])).
+      format("~w_~ts:~w", [Prefix, ntoa(IPAddress), Port])).
 
 format_inet_error(E) -> format("~w (~ts)", [E, format_inet_error0(E)]).
 
@@ -799,11 +799,15 @@ const(X) -> fun () -> X end.
 
 %% Format IPv4-mapped IPv6 addresses as IPv4, since they're what we see
 %% when IPv6 is enabled but not used (i.e. 99% of the time).
+ntoa({local, Path}) ->
+    rabbit_data_coercion:to_unicode_charlist(Path);
 ntoa({0,0,0,0,0,16#ffff,AB,CD}) ->
     inet_parse:ntoa({AB bsr 8, AB rem 256, CD bsr 8, CD rem 256});
 ntoa(IP) ->
     inet_parse:ntoa(IP).
 
+ntoab({local, Path}) ->
+    rabbit_data_coercion:to_utf8_binary(Path);
 ntoab(IP) ->
     Str = ntoa(IP),
     case string:str(Str, ":") of
@@ -989,7 +993,7 @@ os_cmd(Command) ->
             os:cmd(" " ++ Command);
         _ ->
             %% Don't just return "/bin/sh: <cmd>: not found" if not found
-            Exec = hd(string:tokens(Command, " ")),
+            Exec = hd(string:lexemes(Command, " ")),
             case os:find_executable(Exec) of
                 false -> throw({command_not_found, Exec});
                 _     -> os:cmd(Command)
@@ -1056,11 +1060,9 @@ otp_release() ->
                           erlang:system_info(otp_release), "OTP_VERSION"]),
     case raw_read_file(File) of
         {ok, VerBin} ->
-            %% 17.0 or later, we need the file for the minor version
-            string:strip(binary_to_list(VerBin), both, $\n);
+            string:trim(binary_to_list(VerBin), both, "\n");
         {error, _} ->
-            %% R16B03 or earlier (no file, otp_release is correct)
-            %% or we couldn't read the file (so this is best we can do)
+            %% The file could not be read; fall back to the major-only string.
             erlang:system_info(otp_release)
     end.
 
@@ -1068,7 +1070,7 @@ platform_and_version() ->
     string:join(["Erlang/OTP", otp_release()], " ").
 
 otp_system_version() ->
-    string:strip(erlang:system_info(system_version), both, $\n).
+    string:trim(erlang:system_info(system_version), both, "\n").
 
 crypto_lib_version() ->
     rabbit_runtime:crypto_lib_version().
@@ -1163,7 +1165,6 @@ get_proc_name() ->
             {ok, Name}
     end.
 
-%% application:get_env/3 is available in R16B01 or later.
 get_env(Application, Key, Def) ->
     application:get_env(Application, Key, Def).
 

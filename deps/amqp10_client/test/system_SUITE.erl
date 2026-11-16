@@ -57,11 +57,11 @@ groups() ->
                  attach_refused,
                  incoming_heartbeat,
                  multi_transfer_without_delivery_id,
+                 frame_size_too_small_rejected,
+                 max_frame_size_exceeded_rejected,
                  disposition_large_range_settles_outgoing,
                  link_credit_max,
                  drain_with_nothing_available,
-                 frame_size_too_small_rejected,
-                 max_frame_size_exceeded_rejected,
                  connect_timeout
                 ]}
     ].

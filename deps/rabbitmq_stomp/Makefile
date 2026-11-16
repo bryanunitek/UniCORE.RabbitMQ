@@ -9,7 +9,7 @@ define PROJECT_ENV
 	      {passcode, <<"guest">>}]},
 	    {default_vhost, <<"/">>},
 	    {default_topic_exchange, <<"amq.topic">>},
-		{default_nack_requeue, true},
+	    {default_nack_requeue, true},
 	    {ssl_cert_login, false},
 	    {implicit_connect, false},
 	    {tcp_listeners, [61613]},
@@ -30,7 +30,7 @@ define PROJECT_APP_EXTRA_KEYS
 	{broker_version_requirements, []}
 endef
 
-DEPS = ranch rabbit_common rabbit amqp_client
+DEPS = ranch rabbit_common rabbit
 TEST_DEPS = rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_management proper meck
 
 PLT_APPS += rabbitmq_cli $(ELIXIR_ERL_EBIN) ssl
@@ -46,3 +46,9 @@ include ../../erlang.mk
 ELIXIR_ERL_EBIN := $(shell dirname $$(elixir -e 'IO.puts(:code.which(:elixir_erl))' 2>/dev/null))
 DIALYZER_PLT_OPTS += -pa $(ELIXIR_ERL_EBIN)
 DIALYZER_OPTS += -pa $(ELIXIR_ERL_EBIN)
+
+# Regenerate per-function CT test cases from Python test files.
+# The generated .hrl is committed; this rule updates it when Python sources change.
+# Runs only when python3 is available.
+test/python_SUITE_generated.hrl:: $(wildcard test/python_SUITE_data/src/*.py) test/generate_python_tests.py
+	$(if $(shell which python3 2>/dev/null),python3 test/generate_python_tests.py test/python_SUITE_data/src $@,@echo "python3 not found, using committed $@")

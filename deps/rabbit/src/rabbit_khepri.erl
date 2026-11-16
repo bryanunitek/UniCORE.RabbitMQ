@@ -88,8 +88,6 @@
 
 -module(rabbit_khepri).
 
--feature(maybe_expr, enable).
-
 -include_lib("kernel/include/logger.hrl").
 -include_lib("stdlib/include/assert.hrl").
 
@@ -98,6 +96,7 @@
 -include_lib("rabbit_common/include/rabbit.hrl").
 
 -include("include/rabbit_khepri.hrl").
+-include("include/node_metadata.hrl").
 
 %% Initialisation.
 -export([setup/0,
@@ -194,8 +193,10 @@
 -export([topic_binding_projection_v5_enable/1,
          topic_binding_projection_v5_post_enable/1]).
 
+-export([register_projections/0]).
+
 -ifdef(TEST).
--export([register_projections/0,
+-export([
          expand_mnesia_migrations/1,
          mnesia_tables_from_migrations/1]).
 -endif.
@@ -866,6 +867,11 @@ check_cluster_consistency(Node, CheckNodesConsistency) ->
          end of
         error ->
             {error, not_found};
+        {ok, {badrpc, _Reason}} ->
+            %% The peer is reachable but not ready to answer yet (e.g. its
+            %% `rabbit` application hasn't finished loading during a
+            %% concurrent multi-node boot) -- not a real inconsistency.
+            {error, not_found};
         {ok, {_OTP, _Rabbit, {error, _Reason}}} ->
             {error, not_found};
         {ok, {_OTP, _Rabbit, {ok, Status}}} when CheckNodesConsistency ->
@@ -884,7 +890,7 @@ check_cluster_consistency(Node, CheckNodesConsistency) ->
 
 -spec remote_node_info(Node) -> Info when
       Node :: node(),
-      Info :: {OtpVersion, RabbitMQVersion, ClusterStatus},
+      Info :: {OtpVersion, RabbitMQVersion, ClusterStatus} | {badrpc, any()},
       OtpVersion :: string(),
       RabbitMQVersion :: string(),
       ClusterStatus :: {ok, {All, Running}} | {error, any()},
@@ -892,6 +898,9 @@ check_cluster_consistency(Node, CheckNodesConsistency) ->
       Running :: [node()].
 %% @private
 
+%% rpc:call/4 returns {badrpc, Reason} -- not an exception -- when Node is
+%% reachable but node_info/0 itself fails there, e.g. during a concurrent
+%% multi-node boot where `rabbit` hasn't finished loading on Node yet.
 remote_node_info(Node) ->
     rpc:call(Node, ?MODULE, node_info, []).
 
@@ -1374,9 +1383,11 @@ register_projections() ->
                fun register_rabbit_global_runtime_parameters_projection/0,
                fun register_rabbit_per_vhost_runtime_parameters_projection/0,
                fun register_rabbit_user_permissions_projection/0,
+               fun register_rabbit_topic_permissions_projection/0,
                fun register_rabbit_bindings_projection/0,
                fun register_rabbit_route_by_source_key_projection/0,
                fun register_rabbit_route_by_source_projection/0,
+               fun register_rabbit_node_metadata_projection/0,
                fun register_rabbit_topic_binding_projection/0],
     rabbit_misc:for_each_while_ok(
       fun(RegisterFun) ->
@@ -1468,6 +1479,22 @@ register_rabbit_user_permissions_projection() ->
     KeyPos = #user_permission.user_vhost,
     register_simple_projection(Name, PathPattern, KeyPos, false).
 
+register_rabbit_topic_permissions_projection() ->
+    Name = rabbit_khepri_topic_permission,
+    PathPattern = rabbit_db_user:khepri_topic_permission_path(
+                    _UserName = ?KHEPRI_WILDCARD_STAR,
+                    _VHost = ?KHEPRI_WILDCARD_STAR,
+                    _Exchange = ?KHEPRI_WILDCARD_STAR),
+    KeyPos = #topic_permission.topic_permission_key,
+    register_simple_projection(Name, PathPattern, KeyPos, true).
+
+register_rabbit_node_metadata_projection() ->
+    Name = rabbit_khepri_node_metadata,
+    PathPattern = rabbit_db_node_metadata:khepri_node_metadata_path(
+                    _NodeName = ?KHEPRI_WILDCARD_STAR),
+    KeyPos = #node_metadata.node,
+    register_simple_projection(Name, PathPattern, KeyPos, true).
+
 register_simple_projection(Name, PathPattern, KeyPos, ReadConcurrency) ->
     Options = #{keypos => KeyPos,
                 read_concurrency => ReadConcurrency},
@@ -1513,6 +1540,7 @@ register_rabbit_route_by_source_key_projection() ->
                                  {'=/=', '$1', topic},
                                  {'=/=', '$1', fanout},
                                  {'=/=', '$1', 'x-jms-topic'},
+                                 {'=/=', '$1', 'x-jms-selector'},
                                  {'=/=', '$1', 'x-random'}
                                 }]},
     PathPattern = rabbit_db_binding:khepri_route_path(

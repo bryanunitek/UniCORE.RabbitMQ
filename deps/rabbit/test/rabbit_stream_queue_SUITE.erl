@@ -42,6 +42,7 @@ all() ->
      {group, cluster_size_3_parallel_4},
      {group, cluster_size_3_parallel_5},
      {group, cluster_size_3_max_length_bytes},
+     {group, cluster_size_3_initial_offset},
      {group, unclustered_size_3_1},
      {group, unclustered_size_3_2},
      {group, unclustered_size_3_3},
@@ -100,6 +101,8 @@ groups() ->
      {cluster_size_3_parallel_4, [parallel], all_tests_3()},
      {cluster_size_3_parallel_5, [parallel], all_tests_4()},
      {cluster_size_3_max_length_bytes, [], [max_length_bytes]},
+     {cluster_size_3_initial_offset, [shuffle], [initial_offset,
+                                                 initial_offset_zero]},
      {unclustered_size_3_1, [], [add_replica]},
      {unclustered_size_3_2, [], [consume_without_local_replica]},
      {unclustered_size_3_3, [], [grow_coordinator_cluster]},
@@ -157,6 +160,7 @@ all_tests_3() ->
 
 all_tests_4() ->
     [
+     initial_offset_requires_feature_flag,
      max_segment_size_bytes_validation,
      max_segment_size_bytes_policy,
      max_segment_size_bytes_policy_validation,
@@ -191,6 +195,20 @@ init_per_group(cluster_size_3_parallel = Group, Config) ->
         _ ->
             init_per_group1(Group, Config)
     end;
+init_per_group(cluster_size_3_initial_offset = Group, Config) ->
+    case init_per_group1(Group, Config) of
+        {skip, _} = Skip ->
+            Skip;
+        Config1 ->
+            case rabbit_ct_broker_helpers:enable_feature_flag(
+                   Config1, 'rabbitmq_4.4.0') of
+                ok ->
+                    Config1;
+                {skip, _} = Skip ->
+                    _ = end_per_group(Group, Config1),
+                    Skip
+            end
+    end;
 init_per_group(Group, Config) ->
     init_per_group1(Group, Config).
 
@@ -213,6 +231,7 @@ init_per_group1(Group, Config) ->
                       cluster_size_3_parallel_4 -> 3;
                       cluster_size_3_parallel_5 -> 3;
                       cluster_size_3_max_length_bytes -> 3;
+                      cluster_size_3_initial_offset -> 3;
                       cluster_size_3_1 -> 3;
                       cluster_size_3_2 -> 3;
                       cluster_size_3_3 -> 3;
@@ -240,15 +259,20 @@ init_per_group1(Group, Config) ->
                    _ ->
                        Config1
                end,
-    Config1c = rabbit_ct_helpers:merge_app_env(
-                 Config1b, {rabbit, [{forced_feature_flags_on_init, [
-                                                                     restart_streams,
-                                                                     stream_sac_coordinator_unblock_group,
-                                                                     stream_update_config_command,
-                                                                     stream_filtering,
-                                                                     message_containers,
-                                                                     quorum_queue_non_voters
-                                                                    ]}]}),
+    Config1c = case Group of
+                   cluster_size_3_initial_offset ->
+                       Config1b;
+                   _ ->
+                       rabbit_ct_helpers:merge_app_env(
+                         Config1b, {rabbit, [{forced_feature_flags_on_init, [
+                                                                             restart_streams,
+                                                                             stream_sac_coordinator_unblock_group,
+                                                                             stream_update_config_command,
+                                                                             stream_filtering,
+                                                                             message_containers,
+                                                                             quorum_queue_non_voters
+                                                                            ]}]})
+               end,
     Config1d = case Group of
                    cluster_size_3_max_length_bytes ->
                        %% In `max_length_bytes/1`, retention can delete a segment before
@@ -2041,6 +2065,70 @@ max_length_bytes(Config) ->
 
     %% Retention should leave roughly 100 of the 500 published messages.
     ?assert(length(receive_batch()) < 200),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
+
+initial_offset_requires_feature_flag(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Q = ?config(queue_name, Config),
+    %% this group pins an old feature flag baseline
+    ?assertNot(rabbit_ct_broker_helpers:is_feature_flag_enabled(
+                 Config, 'rabbitmq_4.4.0')),
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Config, Server, Q,
+               [{<<"x-queue-type">>, longstr, <<"stream">>},
+                {<<"x-stream-initial-offset">>, long, 1000}])),
+    ?assertExit(
+       {{shutdown, {server_initiated_close, 406, _}}, _},
+       declare(Config, Server, Q,
+               [{<<"x-queue-type">>, longstr, <<"stream">>},
+                {<<"x-stream-initial-offset">>, long, 0}])),
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
+
+initial_offset(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Config, Server, Q,
+                         [{<<"x-queue-type">>, longstr, <<"stream">>},
+                          {<<"x-stream-initial-offset">>, long, 1000}])),
+    queue_utils:wait_for_messages(Config, [[Q, <<"0">>, <<"0">>, <<"0">>]]),
+
+    publish_confirm(Ch, Q, [<<"msg">> || _ <- lists:seq(1, 5)]),
+    queue_utils:wait_for_messages(Config, [[Q, <<"5">>, <<"5">>, <<"0">>]]),
+
+    %% offset 0 is below the first offset and clamps to it
+    Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    qos(Ch1, 10, false),
+    subscribe(Ch1, Q, false, 0),
+    receive_batch(Ch1, 1000, 1004),
+    amqp_channel:call(Ch1, #'basic.cancel'{consumer_tag = <<"ctag">>}),
+
+    Ch2 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    qos(Ch2, 10, false),
+    subscribe(Ch2, Q, false, 1002),
+    receive_batch(Ch2, 1002, 1004),
+    amqp_channel:call(Ch2, #'basic.cancel'{consumer_tag = <<"ctag">>}),
+
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
+
+initial_offset_zero(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    %% an explicit 0 behaves like no initial offset at all
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Config, Server, Q,
+                         [{<<"x-queue-type">>, longstr, <<"stream">>},
+                          {<<"x-stream-initial-offset">>, long, 0}])),
+    publish_confirm(Ch, Q, [<<"msg">> || _ <- lists:seq(1, 3)]),
+    queue_utils:wait_for_messages(Config, [[Q, <<"3">>, <<"3">>, <<"0">>]]),
+    Ch1 = rabbit_ct_client_helpers:open_channel(Config, Server),
+    qos(Ch1, 10, false),
+    subscribe(Ch1, Q, false, 0),
+    receive_batch(Ch1, 0, 2),
+    amqp_channel:call(Ch1, #'basic.cancel'{consumer_tag = <<"ctag">>}),
     rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_testcase_queue, [Q]).
 
 max_segment_size_bytes_validation(Config) ->

@@ -29,6 +29,8 @@
          fill_user_dn_pattern/1, escaped_user_dn/1, simple_bind_fill_pattern/1,
          fill_dn_with_username/2, invalid_credentials_refused/1, with_login/4]).
 
+-define(APP, rabbitmq_auth_backend_ldap).
+
 -define(L(F, A),  log("LDAP "         ++ F, A)).
 -define(L1(F, A), log("    LDAP "     ++ F, A)).
 -define(L2(F, A), log("        LDAP " ++ F, A)).
@@ -790,8 +792,6 @@ ssl_conf(false) ->
 ssl_options() ->
     ssl_options(env(ssl_options)).
 
-ssl_options(undefined) ->
-    ssl_options([{verify, verify_peer}]);
 ssl_options(Opts0) ->
     Opts1 = rabbit_ssl_options:fix_client(Opts0),
     case env(ssl_hostname_verification, undefined) of
@@ -823,14 +823,21 @@ get_expected_env_str(Key, Default) ->
         end,
     rabbit_data_coercion:to_list(V).
 
+env(ssl_options) ->
+    case application:get_env(?APP, ssl_options) of
+        {ok, undefined} -> [{verify, verify_peer}];
+        {ok, V}         -> V;
+        %% be extra defensive against `advanced.config` mistakes
+        undefined       -> [{verify, verify_peer}]
+    end;
 env(Key) ->
-    case application:get_env(rabbitmq_auth_backend_ldap, Key) of
+    case application:get_env(?APP, Key) of
         {ok, V} -> V;
         undefined -> undefined
     end.
 
 env(Key, Default) ->
-    application:get_env(rabbitmq_auth_backend_ldap, Key, Default).
+    application:get_env(?APP, Key, Default).
 
 login_fun(User, UserDN, Password, AuthProps) ->
     fun(L) -> case pget(vhost, AuthProps) of
@@ -1006,7 +1013,7 @@ scrub_dn(DN, network_unsafe) -> DN;
 scrub_dn(DN, false)          -> DN;
 scrub_dn(DN, _) ->
     case is_dn(DN) of
-        true -> scrub_rdn(string:tokens(DN, ","), []);
+        true -> scrub_rdn(string:lexemes(DN, ","), []);
         _    ->
             %% We aren't fully certain its a DN, & don't know what sensitive
             %% info could be contained, thus just scrub the entire credential
@@ -1016,8 +1023,8 @@ scrub_dn(DN, _) ->
 scrub_rdn([], Acc) ->
     string:join(lists:reverse(Acc), ",");
 scrub_rdn([DN|Rem], Acc) ->
-    DN0 = case try string:tokens(DN, "=") catch _:_ -> [] end of
-              L = [RDN, _] -> case string:to_lower(RDN) of
+    DN0 = case try string:lexemes(DN, "=") catch _:_ -> [] end of
+              L = [RDN, _] -> case string:lowercase(RDN) of
                                   "cn"  -> [RDN, ?SCRUBBED_CREDENTIAL];
                                   "dc"  -> [RDN, ?SCRUBBED_CREDENTIAL];
                                   "ou"  -> [RDN, ?SCRUBBED_CREDENTIAL];
@@ -1031,7 +1038,7 @@ scrub_rdn([DN|Rem], Acc) ->
   scrub_rdn(Rem, [string:join(DN0, "=")|Acc]).
 
 is_dn(S) when is_list(S) ->
-    case try string:tokens(rabbit_data_coercion:to_list(S), "=")
+    case try string:lexemes(rabbit_data_coercion:to_list(S), "=")
          catch _:_ -> []
          end of
         L when length(L) > 1 -> true;

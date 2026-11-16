@@ -333,9 +333,6 @@ queue_consumer_channel_closed(Config) ->
 
     amqp_channel:close(Chan),
 
-    %% 1 s polling (default is 50 ms): tight polling re-fires
-    %% `force_stats/1` often enough that on mixed-version CI the
-    %% consumer-cleanup race keeps re-opening.
     ?awaitMatch([],
                 %% assert there are no consumer details
                 begin
@@ -343,7 +340,7 @@ queue_consumer_channel_closed(Config) ->
                     maps:get(consumer_details,
                              http_get(Config, "/queues/%2F/some-queue"))
                 end,
-                60000, 1000),
+                60000),
     ?awaitMatch(<<"some-queue">>,
                 maps:get(name,
                          http_get(Config, "/queues/%2F/some-queue")),
@@ -353,7 +350,7 @@ queue_consumer_channel_closed(Config) ->
     ok.
 
 queue(Config) ->
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     _ = wait_for_queue(Config, "/queues/%2F/some-queue"),
 
     {ok, Chan}  = amqp_connection:open_channel(?config(conn, Config)),
@@ -378,7 +375,7 @@ queue(Config) ->
     ok.
 
 queues_single(Config) ->
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     _ = wait_for_queue(Config, "/queues/%2F/some-queue"),
 
     eventually(?_assertMatch(
@@ -426,7 +423,7 @@ queues_multiple(Config) ->
     ok.
 
 queues_removed(Config) ->
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     force_stats(Config),
     N = length(http_get(Config, "/queues/%2F")),
     http_delete(Config, "/queues/%2F/some-queue", ?NO_CONTENT),
@@ -511,7 +508,7 @@ channel(Config) ->
 
 channel_other_node(Config) ->
     Q = <<"some-queue">>,
-    http_put(Config, "/queues/%2F/some-queue", #{"durable" => true}, [?CREATED, ?NO_CONTENT]),
+    http_put(Config, "/queues/%2F/some-queue", #{<<"durable">> => true}, [?CREATED, ?NO_CONTENT]),
     Conn = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 1),
     {ok, Chan} = amqp_connection:open_channel(Conn),
     [{_, ChData}] = rabbit_ct_broker_helpers:rpc(Config, 1, ets, tab2list,

@@ -66,7 +66,7 @@ getenv(Key) ->
 -spec process_getenv_value(Key :: string(), Value :: string() | false)
     -> string() | false.
 process_getenv_value(Key, false) ->
-  maybe_getenv_with_subkey(Key, string:left(Key, 9));
+  maybe_getenv_with_subkey(Key, string:slice(Key, 0, 9));
 process_getenv_value(_, Value) -> Value.
 
 
@@ -257,7 +257,7 @@ node_name_parse(Value) ->
     -> string().
 node_name_parse(true, Value) -> Value;
 node_name_parse(false, Value) ->
-  Parts = string:tokens(Value, "."),
+  Parts = string:lexemes(Value, "."),
   node_name_parse(length(Parts), Value, Parts).
 
 
@@ -290,7 +290,7 @@ node_prefix() ->
       false -> ?DEFAULT_NODE_PREFIX;
       Value ->
           _ = rabbit_data_coercion:to_list(getenv("RABBITMQ_NODENAME")),
-          lists:nth(1, string:tokens(Value, "@"))
+          hd(string:lexemes(Value, "@"))
   end.
 
 
@@ -302,7 +302,7 @@ node_prefix() ->
 %%--------------------------------------------------------------------
 -spec parse_port(Value :: integer() | string()) -> integer().
 parse_port(Value) when is_list(Value) ->
-  as_integer(lists:last(string:tokens(Value, ":")));
+  as_integer(lists:last(string:lexemes(Value, ":")));
 parse_port(Value) -> as_integer(Value).
 
 
@@ -452,7 +452,7 @@ as_list(Value) when is_atom(Value) ; is_integer(Value) ; is_binary(Value) ->
   [Value];
 as_list(Value) when is_list(Value) ->
   Parse = fun(T) ->
-    S = string:strip(T),
+    S = string:trim(T),
     case string:to_float(S) of
       {Float, []} -> Float;
       _ -> case string:to_integer(S) of
@@ -462,7 +462,7 @@ as_list(Value) when is_list(Value) ->
     end
   end,
   case io_lib:printable_list(Value) or io_lib:printable_unicode_list(Value) of
-    true -> [Parse(T) || T <- string:tokens(Value, ",")];
+    true -> [Parse(T) || T <- string:lexemes(Value, ",")];
     false -> Value
   end;
 as_list(Value) ->

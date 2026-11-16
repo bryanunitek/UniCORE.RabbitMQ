@@ -35,7 +35,11 @@ groups() ->
        socket_opts_preserved_alongside_ranch_opt,
        bare_atoms_stay_in_socket_opts,
        ranch_opt_value_passed_through_verbatim,
-       new_wins_over_existing,
+       configured_ip_is_the_only_ip,
+       certificate_forms_are_recognised,
+       missing_certificate_is_detected,
+       only_new_is_new,
+       new_with_anything_else_is_mixed,
        existing_wins_over_ignore,
        all_ignored_is_ignore]},
      {property_tests, [],
@@ -118,9 +122,31 @@ ranch_opt_value_passed_through_verbatim(_) ->
     Result = ?BUILD([{max_connections, Sentinel}]),
     ?assertMatch(#{max_connections := Sentinel}, Result).
 
-new_wins_over_existing(_) ->
-    ?assertEqual(new, ?COMBINE([existing, new])),
-    ?assertEqual(new, ?COMBINE([new, ignore])).
+configured_ip_is_the_only_ip(_) ->
+    Options = rabbit_web_dispatch_sup:transport_config(
+                [{port, 15671}, {ip, {127, 0, 0, 1}}, {certfile, "c"}, {ip, {0, 0, 0, 0, 0, 0, 0, 0}}]),
+    ?assertEqual([{ip, {127, 0, 0, 1}}], proplists:lookup_all(ip, Options)),
+    ?assertEqual("c", proplists:get_value(certfile, Options)).
+
+certificate_forms_are_recognised(_) ->
+    [?assert(rabbit_web_dispatch_sup:has_certificate([{Key, ignored}]))
+     || Key <- [cert, certfile, certs_keys, sni_fun, sni_hosts]].
+
+missing_certificate_is_detected(_) ->
+    ?assertNot(rabbit_web_dispatch_sup:has_certificate([])),
+    ?assertNot(rabbit_web_dispatch_sup:has_certificate(
+                 [{keyfile, "k"}, {cacertfile, "ca"}, {verify, verify_peer}])).
+
+only_new_is_new(_) ->
+    ?assertEqual(new, ?COMBINE([new])),
+    ?assertEqual(new, ?COMBINE([new, new])).
+
+new_with_anything_else_is_mixed(_) ->
+    ?assertEqual(mixed, ?COMBINE([existing, new])),
+    ?assertEqual(mixed, ?COMBINE([new, existing])),
+    ?assertEqual(mixed, ?COMBINE([new, ignore])),
+    ?assertEqual(mixed, ?COMBINE([ignore, new])),
+    ?assertEqual(mixed, ?COMBINE([ignore, new, existing])).
 
 existing_wins_over_ignore(_) ->
     ?assertEqual(existing, ?COMBINE([ignore, existing])).

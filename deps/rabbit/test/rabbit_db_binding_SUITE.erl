@@ -21,6 +21,7 @@
          end_per_testcase/2,
 
          create/1, create1/1,
+         create_if_absent/1, create_if_absent1/1,
          exists/1, exists1/1,
          delete_v1/1, delete_v2/1, delete1/2,
          auto_delete_v1/1, auto_delete_v2/1, auto_delete1/2,
@@ -34,7 +35,7 @@
          get_all_for_source_and_destination_reverse1/1,
          fold/1, fold1/1,
          match/1, match1/1,
-         match_routing_key/1, match_routing_key1/1,
+         match_routing_key/1,
          tie_binding_to_dest_with_keep_while_cond/1,
          tie_binding_to_dest_with_keep_while_cond1/1,
          tie_binding_to_dest_with_keep_while_cond_orphan_nodes/1,
@@ -94,6 +95,7 @@ groups() ->
 all_tests() ->
     [
      create,
+     create_if_absent,
      exists,
      get_all,
      get_all_by_vhost,
@@ -178,6 +180,28 @@ create1(_Config) ->
     ?assertMatch({error, too_bad},
                  rabbit_db_binding:create(Binding, fun(_, _) -> {error, too_bad} end)),
     ?assertMatch(ok, rabbit_db_binding:create(Binding, fun(_, _) -> ok end)),
+    passed.
+
+create_if_absent(Config) ->
+    passed = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, create_if_absent1, [Config]).
+
+create_if_absent1(_Config) ->
+    XName1 = rabbit_misc:r(?VHOST, exchange, <<"test-exchange1">>),
+    XName2 = rabbit_misc:r(?VHOST, exchange, <<"test-exchange2">>),
+    Exchange1 = #exchange{name = XName1, durable = true, decorators = {[], []}},
+    Exchange2 = #exchange{name = XName2, durable = true, decorators = {[], []}},
+    Binding = #binding{source = XName1, key = <<"">>, destination = XName2, args = #{}},
+    ?assertMatch({error, {resources_missing, [_, _]}},
+                 rabbit_db_binding:create_if_absent(Binding, fun(_, _) -> ok end)),
+    ?assertMatch({new, #exchange{}}, rabbit_db_exchange:create_or_get(Exchange1)),
+    ?assertMatch({new, #exchange{}}, rabbit_db_exchange:create_or_get(Exchange2)),
+    ?assertMatch({error, too_bad},
+                 rabbit_db_binding:create_if_absent(Binding, fun(_, _) -> {error, too_bad} end)),
+    ?assertEqual(false, rabbit_db_binding:exists(Binding)),
+    ?assertEqual({added, Binding},
+                 rabbit_db_binding:create_if_absent(Binding, fun(_, _) -> ok end)),
+    ?assertEqual({existing, Binding},
+                 rabbit_db_binding:create_if_absent(Binding, fun(_, _) -> ok end)),
     passed.
 
 exists(Config) ->
@@ -607,21 +631,6 @@ match1(_Config) ->
 
 match_routing_key(Config) ->
     passed = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, match1, [Config]).
-
-match_routing_key1(_Config) ->
-    XName1 = rabbit_misc:r(?VHOST, exchange, <<"test-exchange1">>),
-    XName2 = rabbit_misc:r(?VHOST, exchange, <<"test-exchange2">>),
-    Exchange1 = #exchange{name = XName1, durable = true, decorators = {[], []}},
-    Exchange2 = #exchange{name = XName2, durable = true, decorators = {[], []}},
-    Binding = #binding{source = XName1, key = <<"*.*">>, destination = XName2,
-                       args = #{foo => bar}},
-    ?assertEqual([], rabbit_db_binding:match_routing_key(XName1, [<<"a.b.c">>], false)),
-    ?assertMatch({new, #exchange{}}, rabbit_db_exchange:create_or_get(Exchange1)),
-    ?assertMatch({new, #exchange{}}, rabbit_db_exchange:create_or_get(Exchange2)),
-    ?assertMatch(ok, rabbit_db_binding:create(Binding, fun(_, _) -> ok end)),
-    ?assertEqual([], rabbit_db_binding:match_routing_key(XName1, [<<"a.b.c">>], false)),
-    ?assertEqual([XName2], rabbit_db_binding:match_routing_key(XName1, [<<"a.b">>], false)),
-    passed.
 
 tie_binding_to_dest_with_keep_while_cond(Config) ->
     passed = rabbit_ct_broker_helpers:rpc(

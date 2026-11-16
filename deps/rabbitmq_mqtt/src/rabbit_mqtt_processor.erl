@@ -5,13 +5,11 @@
 %% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
 -module(rabbit_mqtt_processor).
--feature(maybe_expr, enable).
 
 -export([info/2, init/4, process_packet/2,
          terminate/3, handle_pre_hibernate/0,
          handle_down/2, handle_queue_event/2,
          proto_version_tuple/1, throttle/2, format_status/1,
-         remove_duplicate_client_id_connections/2,
          remove_duplicate_client_id_connections/3,
          update_trace/2, send_disconnect/2]).
 
@@ -25,8 +23,7 @@
               send_fun/0]).
 
 -import(rabbit_mqtt_util, [mqtt_to_amqp/1,
-                           amqp_to_mqtt/1,
-                           ip_address_to_binary/1]).
+                           amqp_to_mqtt/1]).
 -import(rabbit_misc, [maps_put_truthy/3]).
 
 -include_lib("kernel/include/logger.hrl").
@@ -585,11 +582,9 @@ process_request(?UNSUBSCRIBE,
     _ = send(Reply, State),
     {ok, State};
 
-process_request(?PINGREQ, #mqtt_packet{}, State = #state{cfg = #cfg{client_id = ClientId}}) ->
-    ?LOG_DEBUG("Received a PINGREQ from client ID ~s", [ClientId]),
+process_request(?PINGREQ, #mqtt_packet{}, State) ->
     Reply = #mqtt_packet{fixed = #mqtt_packet_fixed{type = ?PINGRESP}},
     _ = send(Reply, State),
-    ?LOG_DEBUG("Sent a PINGRESP to client ID ~s", [ClientId]),
     {ok, State};
 
 process_request(?DISCONNECT,
@@ -753,14 +748,6 @@ register_client_id(VHost, ClientId, CleanStart, WillProps)
                         ?MODULE,
                         remove_duplicate_client_id_connections,
                         [PgGroup, self(), SendWill]).
-
-%% remove_duplicate_client_id_connections/2 is only called from 3.13 nodes.
-%% Hence, this function can be deleted when mixed version clusters between
-%% this version and 3.13 are disallowed.
--spec remove_duplicate_client_id_connections(
-        {rabbit_types:vhost(), client_id()}, pid()) -> ok.
-remove_duplicate_client_id_connections(PgGroup, PidToKeep) ->
-    remove_duplicate_client_id_connections(PgGroup, PidToKeep, true).
 
 -spec remove_duplicate_client_id_connections(
         {rabbit_types:vhost(), client_id()}, pid(), boolean()) -> ok.
@@ -1289,7 +1276,7 @@ get_vhost_username(UserBin) ->
 
 get_vhost_from_user_mapping(User) ->
     UserVirtualHostMapping = rabbit_runtime_parameters:value_global(
-                               mqtt_default_vhosts
+                               <<"mqtt_default_vhosts">>
                               ),
     get_vhost_from_user_mapping(User, UserVirtualHostMapping).
 
@@ -1306,7 +1293,7 @@ get_vhost_from_user_mapping(User, Mapping) ->
 
 get_vhost_from_port_mapping(Port) ->
     PortVirtualHostMapping = rabbit_runtime_parameters:value_global(
-                               mqtt_port_to_vhost_mapping
+                               <<"mqtt_port_to_vhost_mapping">>
                               ),
     get_vhost_from_port_mapping(Port, PortVirtualHostMapping).
 

@@ -74,7 +74,7 @@ defmodule RabbitMQ.CLI.Core.Listeners do
     %{
       node: node,
       protocol: protocol,
-      interface: :inet.ntoa(interface) |> to_string |> maybe_enquote_interface,
+      interface: format_interface(interface),
       port: port,
       purpose: protocol_label(to_atom(protocol))
     }
@@ -91,7 +91,7 @@ defmodule RabbitMQ.CLI.Core.Listeners do
     %{
       node: node,
       protocol: protocol,
-      interface: :inet.ntoa(interface) |> to_string |> maybe_enquote_interface,
+      interface: format_interface(interface),
       port: port,
       purpose: protocol_label(to_atom(protocol)),
       certfile: read_cert(Keyword.get(opts, :certfile)),
@@ -159,7 +159,7 @@ defmodule RabbitMQ.CLI.Core.Listeners do
     %{
       node: node,
       protocol: protocol,
-      interface: :inet.ntoa(interface) |> to_string |> maybe_enquote_interface,
+      interface: format_interface(interface),
       port: port,
       purpose: protocol_label(to_atom(protocol)),
       certfile: certfile |> to_string,
@@ -286,7 +286,7 @@ defmodule RabbitMQ.CLI.Core.Listeners do
       [
         node: node,
         protocol: protocol,
-        interface: :inet.ntoa(interface) |> to_string |> maybe_enquote_interface,
+        interface: format_interface(interface),
         port: port,
         purpose: protocol_label(to_atom(protocol))
       ]
@@ -389,6 +389,9 @@ defmodule RabbitMQ.CLI.Core.Listeners do
   #
   # Implementation
   #
+
+  defp format_interface({:local, path}), do: to_string(path)
+  defp format_interface(interface), do: :inet.ntoa(interface) |> to_string |> maybe_enquote_interface
 
   defp maybe_enquote_interface(value) do
     # This simplistic way of distinguishing IPv6 addresses,

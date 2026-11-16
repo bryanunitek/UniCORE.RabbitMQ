@@ -15,11 +15,6 @@
 %% Only used in tests.
 -export([decrypt_config/2]).
 
-%% These can be removed when we only support OTP-26+.
--ignore_xref([{user_drv, whereis_group, 0},
-              {group, interfaces, 1},
-              {user_drv, interfaces, 1}]).
--dialyzer({nowarn_function, [get_input_iodevice/0]}).
 
 setup(Context) ->
     ?LOG_DEBUG(
@@ -127,12 +122,7 @@ set_default_config() ->
                 {schedule_ms_limit, 0},
                 {heap_word_limit, 0},
                 {busy_port, false},
-                {busy_dist_port, true}]},
-              {mnesia,
-               [
-                {dump_log_write_threshold, 5000},
-                {dump_log_time_threshold, 90000}
-               ]}
+                {busy_dist_port, true}]}
               | OsirisConfig
              ],
     %% Don't apply any defaults for values already set in the init flags.
@@ -577,28 +567,9 @@ get_passphrase(ConfigEntryDecoder) ->
 %% This function will not work when either -oldshell or -noinput
 %% options are passed to erl.
 get_input_iodevice() ->
-    case erlang:function_exported(user_drv, whereis_group, 0) of
-        true ->
-            case user_drv:whereis_group() of
-                undefined -> user;
-                IoDevice -> IoDevice
-            end;
-        %% Necessary for OTP versions before OTP-26.
-        false ->
-            case whereis(user) of
-                undefined ->
-                    user;
-                User ->
-                    case group:interfaces(User) of
-                        [] ->
-                            user;
-                        [{user_drv, Drv}] ->
-                            case user_drv:interfaces(Drv) of
-                                []                          -> user;
-                                [{current_group, IoDevice}] -> IoDevice
-                            end
-                    end
-            end
+    case user_drv:whereis_group() of
+        undefined -> user;
+        IoDevice  -> IoDevice
     end.
 
 disable_kernel_overlapping_partitions() ->

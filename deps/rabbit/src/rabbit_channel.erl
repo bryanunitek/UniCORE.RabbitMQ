@@ -64,6 +64,7 @@
 
 %% Internal
 -export([list_local/0, emit_info_local/3]).
+-export([is_local/1]).
 -export([get_vhost/1, get_user/1]).
 %% For testing
 -export([build_topic_variable_map/3]).
@@ -302,7 +303,9 @@ list() ->
 -spec list_local() -> [pid()].
 
 list_local() ->
-    pg_local:get_members(rabbit_channels).
+    try pg:which_groups(pg_scope())
+    catch error:badarg -> []
+    end.
 
 -spec info_keys() -> rabbit_types:info_keys().
 
@@ -415,6 +418,14 @@ update_user_state(Pid, UserState) when is_pid(Pid) ->
 
 %%---------------------------------------------------------------------------
 
+-spec is_local(pid()) -> boolean().
+is_local(Pid) ->
+    pg:get_local_members(pg_scope(), Pid) =/= [].
+
+-spec pg_scope() -> atom().
+pg_scope() ->
+    rabbit:pg_scope_amqp091_channel().
+
 init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
       Capabilities, CollectorPid, LimiterPid, AmqpParams]) ->
     process_flag(trap_exit, true),
@@ -423,7 +434,7 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
 
     ?LG_PROCESS_TYPE(channel),
     ?store_proc_name({ConnName, Channel}),
-    ok = pg_local:join(rabbit_channels, self()),
+    ok = pg:join(pg_scope(), self(), self()),
     Flow = case rabbit_misc:get_env(rabbit, classic_queue_flow_control, true) of
              true   -> flow;
              false  -> noflow
@@ -753,7 +764,7 @@ terminate(_Reason,
     try
         rabbit_queue_type:close(QueueCtxs),
         {_Res, _State1} = notify_queues(State),
-        pg_local:leave(rabbit_channels, self()),
+        pg:leave(pg_scope(), self(), self()),
         rabbit_event:if_enabled(State, #ch.stats_timer,
                                 fun() -> emit_stats(State) end),
         [delete_stats(Tag) || {Tag, _} <- get()],
@@ -2388,10 +2399,6 @@ i(cached_segments,   #ch{queue_states = QS}) ->
 i(state,                   #ch{cfg = #conf{state = running}}) -> credit_flow:state();
 i(state,                   #ch{cfg = #conf{state = State}}) -> State;
 i(prefetch_count,          #ch{cfg = #conf{consumer_prefetch = C}})    -> C;
-%% Retained for backwards compatibility e.g. in mixed version clusters,
-%% can be removed starting with 4.2. MK.
-i(global_prefetch_count, #ch{limiter = Limiter}) ->
-    rabbit_limiter:get_prefetch_limit(Limiter);
 i(interceptors, #ch{interceptor_state = IState}) ->
     IState;
 i(garbage_collection, _State) ->
@@ -2528,11 +2535,12 @@ handle_method(#'queue.declare'{queue       = QueueNameBin,
                 true  -> ConnPid;
                 false -> none
             end,
+    Args0Stripped = lists:keydelete(<<"x-name-prefix">>, 1, Args0),
     Args = rabbit_amqqueue:augment_declare_args(VHostPath,
                                                 DurableDeclare,
                                                 ExclusiveDeclare,
                                                 AutoDelete,
-                                                Args0),
+                                                Args0Stripped),
     StrippedQueueNameBin = strip_cr_lf(QueueNameBin),
     Durable = DurableDeclare andalso not ExclusiveDeclare,
     Kind = queue,
@@ -2540,7 +2548,17 @@ handle_method(#'queue.declare'{queue       = QueueNameBin,
                         <<>> ->
                             case rabbit_amqqueue:is_server_named_allowed(Args) of
                                 true ->
-                                    rabbit_guid:binary(rabbit_guid:gen_secure(), "amq.gen");
+                                    NamePrefix =
+                                        case rabbit_amqqueue:server_named_queue_prefix(Args0) of
+                                            {ok, P} ->
+                                                strip_cr_lf(P);
+                                            {error, {prefix_too_long, P}} ->
+                                                rabbit_misc:protocol_error(
+                                                  precondition_failed,
+                                                  "Queue name prefix '~ts' exceeds the 64-byte limit",
+                                                  [strip_cr_lf(P)])
+                                        end,
+                                    rabbit_guid:binary(rabbit_guid:gen_secure(), NamePrefix);
                                 false ->
                                     rabbit_misc:protocol_error(
                                       precondition_failed,

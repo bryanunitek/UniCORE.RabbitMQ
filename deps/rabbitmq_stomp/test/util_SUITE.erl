@@ -8,8 +8,7 @@
 -module(util_SUITE).
 
 -include_lib("eunit/include/eunit.hrl").
--include_lib("amqp_client/include/amqp_client.hrl").
--include("rabbit_stomp_routing_prefixes.hrl").
+-include_lib("rabbit_common/include/rabbit_framing.hrl").
 -include("rabbit_stomp_frame.hrl").
 -include("rabbit_stomp_headers.hrl").
 -compile(export_all).
@@ -41,7 +40,9 @@ all() -> [
     consumer_tag_destination,
     consumer_tag_invalid,
     parse_valid_message_id,
-    parse_invalid_message_id
+    parse_invalid_message_id,
+    subscription_queue_name_matches_4_3,
+    subscription_queue_name_from_header
     ].
 
 
@@ -51,25 +52,25 @@ all() -> [
 
 longstr_field(_) ->
     {<<"ABC">>, longstr, <<"DEF">>} =
-        rabbit_stomp_util:longstr_field("ABC", "DEF").
+        rabbit_stomp_util:longstr_field(<<"ABC">>, <<"DEF">>).
 
 message_properties(_) ->
-    Headers = [
-                {"content-type", "text/plain"},
-                {"content-encoding", "UTF-8"},
-                {"persistent", "true"},
-                {"priority", "1"},
-                {"correlation-id", "123"},
-                {"reply-to", "something"},
-                {"expiration", "my-expiration"},
-                {"amqp-message-id", "M123"},
-                {"timestamp", "123456"},
-                {"type", "freshly-squeezed"},
-                {"user-id", "joe"},
-                {"app-id", "joe's app"},
-                {"str", "foo"},
-                {"int", "123"}
-              ],
+    Headers = #{
+                <<"content-type">> => <<"text/plain">>,
+                <<"content-encoding">> => <<"UTF-8">>,
+                <<"persistent">> => <<"true">>,
+                <<"priority">> => <<"1">>,
+                <<"correlation-id">> => <<"123">>,
+                <<"reply-to">> => <<"something">>,
+                <<"expiration">> => <<"my-expiration">>,
+                <<"amqp-message-id">> => <<"M123">>,
+                <<"timestamp">> => <<"123456">>,
+                <<"type">> => <<"freshly-squeezed">>,
+                <<"user-id">> => <<"joe">>,
+                <<"app-id">> => <<"joe's app">>,
+                <<"str">> => <<"foo">>,
+                <<"int">> => <<"123">>
+              },
 
     #'P_basic'{
                 content_type     = <<"text/plain">>,
@@ -90,14 +91,14 @@ message_properties(_) ->
         rabbit_stomp_util:message_properties(#stomp_frame{headers = Headers}).
 
 message_properties_strips_reserved_headers(_) ->
-    Headers = [
-               {"message-id", "publisher-message-id"},
-               {"ack", "publisher-ack"},
-               {"subscription", "publisher-subscription"},
-               {"redelivered", "publisher-redelivered"},
-               {"destination", "publisher-destination"},
-               {"str", "foo"}
-              ],
+    Headers = #{
+                <<"message-id">> => <<"forged-message-id">>,
+                <<"ack">> => <<"forged-ack">>,
+                <<"subscription">> => <<"forged-subscription">>,
+                <<"redelivered">> => <<"forged-redelivered">>,
+                <<"destination">> => <<"forged-destination">>,
+                <<"str">> => <<"foo">>
+              },
 
     #'P_basic'{headers = [{<<"str">>, longstr, <<"foo">>}]} =
         rabbit_stomp_util:message_properties(#stomp_frame{headers = Headers}).
@@ -121,20 +122,20 @@ message_headers(_) ->
     Headers = rabbit_stomp_util:message_headers(Properties),
 
     Expected = [
-                {"content-type", "text/plain"},
-                {"content-encoding", "UTF-8"},
-                {"persistent", "true"},
-                {"priority", "1"},
-                {"correlation-id", "123"},
-                {"reply-to", "something"},
-                {"expiration", "my-expiration"},
-                {"amqp-message-id", "M123"},
-                {"timestamp", "123456"},
-                {"type", "freshly-squeezed"},
-                {"user-id", "joe"},
-                {"app-id", "joe's app"},
-                {"str", "foo"},
-                {"int", "123"}
+                {<<"content-type">>, <<"text/plain">>},
+                {<<"content-encoding">>, <<"UTF-8">>},
+                {<<"persistent">>, <<"true">>},
+                {<<"priority">>, <<"1">>},
+                {<<"correlation-id">>, <<"123">>},
+                {<<"reply-to">>, <<"something">>},
+                {<<"expiration">>, <<"my-expiration">>},
+                {<<"amqp-message-id">>, <<"M123">>},
+                {<<"timestamp">>, <<"123456">>},
+                {<<"type">>, <<"freshly-squeezed">>},
+                {<<"user-id">>, <<"joe">>},
+                {<<"app-id">>, <<"joe's app">>},
+                {<<"str">>, <<"foo">>},
+                {<<"int">>, <<"123">>}
                ],
 
     [] = lists:subtract(Headers, Expected).
@@ -144,69 +145,57 @@ minimal_message_headers_with_no_custom(_) ->
 
     Headers = rabbit_stomp_util:message_headers(Properties),
     Expected = [
-                {"content-type", "text/plain"},
-                {"content-encoding", "UTF-8"},
-                {"amqp-message-id", "M123"}
+                {<<"content-type">>, <<"text/plain">>},
+                {<<"content-encoding">>, <<"UTF-8">>},
+                {<<"amqp-message-id">>, <<"M123">>}
                ],
 
     [] = lists:subtract(Headers, Expected).
 
-%% A publisher (STOMP or AMQP 0-9-1) controls `#'P_basic'.headers`, so the
-%% server-generated `message-id`, `ack`, `subscription`, `redelivered` and
-%% `destination` headers take precedence over the publisher's values of the
-%% same name.
+%% A publisher (STOMP or AMQP) controls #'P_basic'.headers, so it must not
+%% be able to override the server-generated message-id/ack/subscription/
+%% redelivered/destination seen by a STOMP consumer.
 headers_reserved_names_cannot_be_overridden(_) ->
     Properties = #'P_basic'{
-      headers = [{<<"message-id">>, longstr, <<"publisher-message-id">>},
-                 {<<"ack">>, longstr, <<"publisher-ack">>},
-                 {<<"subscription">>, longstr, <<"publisher-subscription">>},
-                 {<<"redelivered">>, longstr, <<"publisher-redelivered">>},
-                 {<<"destination">>, longstr, <<"publisher-destination">>}]},
-    Delivery = #'basic.deliver'{consumer_tag = <<"T_orders">>,
-                                delivery_tag = 42,
-                                exchange     = <<>>,
-                                routing_key  = <<"routing-key">>,
-                                redelivered  = true},
+      headers = [{<<"message-id">>, longstr, <<"forged-message-id">>},
+                 {<<"ack">>, longstr, <<"forged-ack">>},
+                 {<<"subscription">>, longstr, <<"forged-subscription">>},
+                 {<<"redelivered">>, longstr, <<"forged-redelivered">>},
+                 {<<"destination">>, longstr, <<"forged-destination">>}]},
 
     Headers = rabbit_stomp_util:headers(
-                "session123", Delivery, Properties, client, "1.2"),
+                "session123", <<"T_orders">>, 42,
+                <<>>, <<"routing-key">>, true,
+                Properties, client, "1.2"),
 
     ExpectedMessageId = <<"T_orders@@session123@@42">>,
-    ExpectedMessageId =
-        iolist_to_binary(proplists:get_value(?HEADER_MESSAGE_ID, Headers)),
-    ExpectedMessageId =
-        iolist_to_binary(proplists:get_value(?HEADER_ACK, Headers)),
-    "orders" = proplists:get_value(?HEADER_SUBSCRIPTION, Headers),
-    true = proplists:get_value(?HEADER_REDELIVERED, Headers),
-    "/queue/routing-key" = proplists:get_value(?HEADER_DESTINATION, Headers),
-
-    %% Every header name must be unique.
-    Names = [Name || {Name, _} <- Headers],
-    ?assertEqual(lists:usort(Names), lists:sort(Names)),
-    ?assertEqual([], [V || {_, V} <- Headers, is_list(V),
-                           lists:prefix("publisher-", V)]).
+    #{<<"message-id">> := ExpectedMessageId,
+      <<"ack">> := ExpectedMessageId,
+      <<"subscription">> := <<"orders">>,
+      <<"redelivered">> := true,
+      <<"destination">> := <<"/queue/routing-key">>} = Headers.
 
 headers_post_process(_) ->
-    Headers  = [{"header1", "1"},
-                {"header2", "12"},
-                {"reply-to", "something"}],
-    Expected = [{"header1", "1"},
-                {"header2", "12"},
-                {"reply-to", "/reply-queue/something"}],
+    Headers  = [{<<"header1">>, <<"1">>},
+                {<<"header2">>, <<"12">>},
+                {<<"reply-to">>, <<"something">>}],
+    Expected = [{<<"header1">>, <<"1">>},
+                {<<"header2">>, <<"12">>},
+                {<<"reply-to">>, <<"/reply-queue/something">>}],
     [] = lists:subtract(
            rabbit_stomp_util:headers_post_process(Headers), Expected).
 
 headers_post_process_noop_replyto(_) ->
     [begin
-         Headers = [{"reply-to", Prefix ++ "/something"}],
+         Headers = [{<<"reply-to">>, <<Prefix/binary, "/something">>}],
          Headers = rabbit_stomp_util:headers_post_process(Headers)
-     end || Prefix <- rabbit_stomp_routing_util:dest_prefixes()].
+     end || Prefix <- ?DEST_PREFIXES].
 
 headers_post_process_noop2(_) ->
-    Headers  = [{"header1", "1"},
-                {"header2", "12"}],
-    Expected = [{"header1", "1"},
-                {"header2", "12"}],
+    Headers  = [{<<"header1">>, <<"1">>},
+                {<<"header2">>, <<"12">>}],
+    Expected = [{<<"header1">>, <<"1">>},
+                {<<"header2">>, <<"12">>}],
     [] = lists:subtract(
            rabbit_stomp_util:headers_post_process(Headers), Expected).
 
@@ -242,40 +231,40 @@ negotiate_version_choice_duplicates(_) ->
         rabbit_stomp_util:negotiate_version(["1.2", "1.2"],
                                             ["1.2", "1.2"]).
 trim_headers(_) ->
-    #stomp_frame{headers = [{"one", "foo"}, {"two", "baz "}]} =
+    #stomp_frame{headers = #{<<"one">> := <<"foo">>, <<"two">> := <<"baz ">>}} =
         rabbit_stomp_util:trim_headers(
-          #stomp_frame{headers = [{"one", "  foo"}, {"two", " baz "}]}).
+          #stomp_frame{headers = #{<<"one">> => <<"  foo">>, <<"two">> => <<" baz ">>}}).
 
 %%--------------------------------------------------------------------
 %% Frame Parsing Tests
 %%--------------------------------------------------------------------
 
 ack_mode_auto(_) ->
-    Frame = #stomp_frame{headers = [{"ack", "auto"}]},
+    Frame = #stomp_frame{headers = #{<<"ack">> => <<"auto">>}},
     {auto, _} = rabbit_stomp_util:ack_mode(Frame).
 
 ack_mode_auto_default(_) ->
-    Frame = #stomp_frame{headers = []},
+    Frame = #stomp_frame{headers = #{}},
     {auto, _} = rabbit_stomp_util:ack_mode(Frame).
 
 ack_mode_client(_) ->
-    Frame = #stomp_frame{headers = [{"ack", "client"}]},
+    Frame = #stomp_frame{headers = #{<<"ack">> => <<"client">>}},
     {client, true} = rabbit_stomp_util:ack_mode(Frame).
 
 ack_mode_client_individual(_) ->
-    Frame = #stomp_frame{headers = [{"ack", "client-individual"}]},
+    Frame = #stomp_frame{headers = #{<<"ack">> => <<"client-individual">>}},
     {client, false} = rabbit_stomp_util:ack_mode(Frame).
 
 consumer_tag_id(_) ->
-    Frame = #stomp_frame{headers = [{"id", "foo"}]},
+    Frame = #stomp_frame{headers = #{<<"id">> => <<"foo">>}},
     {ok, <<"T_foo">>, _} = rabbit_stomp_util:consumer_tag(Frame).
 
 consumer_tag_destination(_) ->
-    Frame = #stomp_frame{headers = [{"destination", "foo"}]},
+    Frame = #stomp_frame{headers = #{<<"destination">> => <<"foo">>}},
     {ok, <<"Q_foo">>, _} = rabbit_stomp_util:consumer_tag(Frame).
 
 consumer_tag_invalid(_) ->
-    Frame = #stomp_frame{headers = []},
+    Frame = #stomp_frame{headers = #{}},
     {error, missing_destination_header} = rabbit_stomp_util:consumer_tag(Frame).
 
 %%--------------------------------------------------------------------
@@ -284,8 +273,34 @@ consumer_tag_invalid(_) ->
 
 parse_valid_message_id(_) ->
     {ok, {<<"bar">>, "abc", 123}} =
-        rabbit_stomp_util:parse_message_id("bar@@abc@@123").
+        rabbit_stomp_util:parse_message_id(<<"bar@@abc@@123">>).
 
 parse_invalid_message_id(_) ->
     {error, invalid_message_id} =
-        rabbit_stomp_util:parse_message_id("blah").
+        rabbit_stomp_util:parse_message_id(<<"blah">>).
+
+subscription_queue_name_matches_4_3(_) ->
+    Frame = #stomp_frame{headers = #{}},
+    lists:foreach(
+      fun({Destination, Id, Expected}) ->
+              ?assertEqual(Expected,
+                           rabbit_stomp_util:subscription_queue_name(Destination, Id, Frame))
+      end,
+      [{<<"ascii">>, <<"d1">>, <<"stomp-subscription-XDrH2Y3c7_jz3DjSx7MIBA">>},
+       {<<"a/b">>, <<"d4">>, <<"stomp-subscription-V_WQzD3fcIsVt-6i0_pvfw">>},
+       {<<"a%2Fb">>, <<"d5">>, <<"stomp-subscription-wRP4G7QVZ0L4lqC6dAjMkw">>},
+       {<<"a.b.*">>, <<"d6">>, <<"stomp-subscription-3HrQwKYlwVPxfE4gu0RS6Q">>},
+       {<<>>, <<"d7">>, <<"stomp-subscription-6E6ZEnCmC9A3B-aApBYEJA">>},
+       {<<"日本"/utf8>>, <<"идентификатор"/utf8>>,
+        <<"stomp-subscription-FhsDeJnFyW6rGZ3dHA4aQA">>}]).
+
+subscription_queue_name_from_header(_) ->
+    Name = fun(Value) ->
+                   rabbit_stomp_util:subscription_queue_name(
+                     <<"dest">>, <<"id">>,
+                     #stomp_frame{headers = #{<<"x-queue-name">> => Value}})
+           end,
+    ?assertEqual(<<"queue-name">>, Name(<<"queue-\r\nname">>)),
+    ?assertMatch(<<"stomp-subscription-", _/binary>>, Name(<<>>)),
+    ?assertMatch(<<"stomp-subscription-", _/binary>>, Name(<<" ">>)),
+    ?assertMatch(<<"stomp-subscription-", _/binary>>, Name(<<"\r\n">>)).

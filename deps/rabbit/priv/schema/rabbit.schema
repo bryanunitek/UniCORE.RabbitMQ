@@ -23,7 +23,7 @@
 ]}.
 
 {mapping, "listeners.tcp.$name", "rabbit.tcp_listeners",[
-    {datatype, [integer, ip]}
+    {datatype, [integer, ip, domain_socket]}
 ]}.
 
 {translation, "rabbit.tcp_listeners",
@@ -46,7 +46,7 @@ end}.
 ]}.
 
 {mapping, "listeners.ssl.$name", "rabbit.ssl_listeners",[
-    {datatype, [integer, ip]}
+    {datatype, [integer, ip, domain_socket]}
 ]}.
 
 {translation, "rabbit.ssl_listeners",
@@ -430,6 +430,15 @@ end}.
 {mapping, "metadata_store.khepri.snapshot_interval", "rabbit.khepri_snapshot_interval",
     [{datatype, {integer, positive}}]}.
 
+{mapping, "sole_connection.tick_interval", "rabbit.sole_connection_tick_interval",
+    [{datatype, {integer, positive}}]}.
+
+{mapping, "sole_connection.leader_wait_retry_timeout", "rabbit.sole_connection_leader_wait_retry_timeout",
+    [{datatype, {integer, positive}}]}.
+
+{mapping, "sole_connection.default_timeout", "rabbit.sole_connection_default_timeout",
+    [{datatype, {integer, positive}}]}.
+
 %% ===========================================================================
 
 %% Choose the available SASL mechanism(s) to expose.
@@ -600,6 +609,7 @@ end}.
 %% as a temporary measure!) by setting this to rabbit_password_hashing_md5.
 %%
 %% To use SHA-512, set to rabbit_password_hashing_sha512.
+%% To use PBKDF2-HMAC-SHA256, set to rabbit_password_hashing_pbkdf2_sha256.
 %%
 %% {password_hashing_module, rabbit_password_hashing_sha256},
 
@@ -1070,7 +1080,7 @@ end}.
 %%
 %% {vm_memory_high_watermark, {absolute, 1073741824}},
 %%
-%% Or you can set absolute value using memory unit symbols (with RabbitMQ 3.6.0+).
+%% Or you can set absolute value using memory unit symbols.
 %%
 %% {vm_memory_high_watermark, {absolute, "1024M"}},
 %%
@@ -1243,15 +1253,18 @@ end}.
     {datatype, {integer, non_negative}}
 ]}.
 
+%% DEPRECATED. Not used since RabbitMQ 4.0, classic queue mirroring was removed.
+%%
 %% Mirror sync batch size, in messages. Increasing this will speed
 %% up syncing but total batch size in bytes must not exceed 2 GiB.
-%% Available in RabbitMQ 3.6.0 or later.
 %%
 %% {mirroring_sync_batch_size, 4096},
 
 {mapping, "mirroring_sync_batch_size", "rabbit.mirroring_sync_batch_size",
     [{datatype, bytesize}, {validators, ["mirroring_sync_batch_size"]}]}.
 
+%% DEPRECATED. Not used since RabbitMQ 4.0, classic queue mirroring was removed.
+%%
 %% Mirror sync max throughput (in bytes) per second.
 %% Supported unit symbols:
 %% k, kiB: kibibytes (2^10 - 1,024 bytes)
@@ -2092,6 +2105,8 @@ end}.
     {datatype, integer}
 ]}.
 
+%% DEPRECATED. Not used since RabbitMQ 4.0, classic queue mirroring was removed.
+%%
 %% Mirroring log.
 {mapping, "log.mirroring.level", "rabbit.log.categories.mirroring.level", [
     {datatype, {enum, [debug, info, notice, warning, error, critical, alert, emergency, none]}}
@@ -2657,6 +2672,10 @@ end}.
 
 {mapping, "quorum_queue.initial_cluster_size", "rabbit.quorum_cluster_size", [
   {datatype, {integer, positive}}
+]}.
+
+{mapping, "quorum_queue.member_placement_tag", "rabbit.quorum_queue_member_placement_tag", [
+  {datatype, binary}
 ]}.
 
 {mapping, "quorum_queue.commands_soft_limit", "rabbit.quorum_commands_soft_limit", [

@@ -194,10 +194,10 @@ print(Val) ->
 %% TODO - can we remove all these "unknown" cases? Coverage never hits them.
 
 ip(unknown) -> unknown;
-ip(IP)      -> list_to_binary(rabbit_misc:ntoa(IP)).
+ip(IP)      -> rabbit_data_coercion:to_utf8_binary(rabbit_misc:ntoa(IP)).
 
 ipb(unknown) -> unknown;
-ipb(IP)      -> list_to_binary(rabbit_misc:ntoab(IP)).
+ipb(IP)      -> iolist_to_binary(rabbit_misc:ntoab(IP)).
 
 addr(S)    when is_list(S); is_atom(S); is_binary(S) -> print("~ts", S);
 addr(Addr) when is_tuple(Addr)                       -> ip(Addr).
@@ -260,9 +260,9 @@ policy(Policy) -> [{policy, Policy}].
 
 internal_user(User) ->
     [{name,              internal_user:get_username(User)},
-     {password_hash,     base64:encode(internal_user:get_password_hash(User))},
      {hashing_algorithm, rabbit_auth_backend_internal:hashing_module_for_user(
                              User)},
+     {has_password,      byte_size(internal_user:get_password_hash(User)) > 0},
      {tags,              tags_as_binaries(internal_user:get_tags(User))},
      {limits,            internal_user:get_limits(User)}].
 
