@@ -116,6 +116,40 @@
  "rabbitmq_auth_backend_oauth2.require_exp",
  [{datatype, boolean}]}.
 
+%% Require the jwks_uri, token_endpoint, authorization_endpoint and
+%% end_session_endpoint of a discovered OpenID configuration to use the https
+%% scheme. Set to false only when your identity provider's discovery document
+%% uses http, for example in a development or test environment.
+%%
+%% {verify_https_endpoints, true},
+
+{mapping,
+ "auth_oauth2.discovery.verify_https_endpoints",
+ "rabbitmq_auth_backend_oauth2.discovery.verify_https_endpoints",
+ [{datatype, boolean}]}.
+
+%% Verify that the issuer discovered in an OpenID configuration document is
+%% present, uses the https scheme, and matches the discovery endpoint used to
+%% retrieve it, per OpenID Connect Discovery 1.0, Section 4.3. Set to false
+%% only when your identity provider's issuer does not follow this
+%% convention.
+%%
+%% {verify_issuer, true},
+
+{mapping,
+ "auth_oauth2.discovery.verify_issuer",
+ "rabbitmq_auth_backend_oauth2.discovery.verify_issuer",
+ [{datatype, boolean}]}.
+
+%% How scope patterns match vhost names, resource names, and topic routing keys.
+%% wildcard uses RabbitMQ's legacy *-segment wildcard rules; regex treats each pattern
+%% as a Perl-compatible regular expression matched against the entire string.
+
+{mapping,
+ "auth_oauth2.scope_pattern_syntax",
+ "rabbitmq_auth_backend_oauth2.scope_pattern_syntax",
+ [{datatype, {enum, [wildcard, regex]}}]}.
+
 %% Configure the preferred username's JWT claim(s). These are the JWT claims or attributes
 %% used to determine the user's identity, a.k.a username.
 %% RabbitMQ appends `sub` and `client_id` claims.
@@ -371,6 +405,17 @@
  "rabbitmq_auth_backend_oauth2.oauth_providers",
  [{datatype, string}]}.
 
+{mapping,
+ "auth_oauth2.oauth_providers.$name.discovery.verify_https_endpoints",
+ "rabbitmq_auth_backend_oauth2.oauth_providers",
+ [{datatype, boolean}]}.
+
+{mapping,
+ "auth_oauth2.oauth_providers.$name.discovery.verify_issuer",
+ "rabbitmq_auth_backend_oauth2.oauth_providers",
+ [{datatype, boolean}]}.
+
+
 {translation, "rabbitmq_auth_backend_oauth2.oauth_providers",
  fun(Conf) ->
     rabbit_oauth2_schema:translate_oauth_providers(Conf)
@@ -399,6 +444,12 @@
   "auth_oauth2.resource_servers.$name.resource_server_type",
   "rabbitmq_auth_backend_oauth2.resource_servers",
   [{datatype, string}]
+}.
+
+{mapping,
+  "auth_oauth2.resource_servers.$name.scope_pattern_syntax",
+  "rabbitmq_auth_backend_oauth2.resource_servers",
+  [{datatype, {enum, [wildcard, regex]}}]
 }.
 
 {mapping,

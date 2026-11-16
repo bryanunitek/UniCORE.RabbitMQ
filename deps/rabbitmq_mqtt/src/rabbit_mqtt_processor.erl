@@ -5,13 +5,11 @@
 %% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
 -module(rabbit_mqtt_processor).
--feature(maybe_expr, enable).
 
 -export([info/2, init/4, process_packet/2,
          terminate/3, handle_pre_hibernate/0,
          handle_down/2, handle_queue_event/2,
          proto_version_tuple/1, throttle/2, format_status/1,
-         remove_duplicate_client_id_connections/2,
          remove_duplicate_client_id_connections/3,
          update_trace/2, send_disconnect/2]).
 
@@ -25,8 +23,7 @@
               send_fun/0]).
 
 -import(rabbit_mqtt_util, [mqtt_to_amqp/1,
-                           amqp_to_mqtt/1,
-                           ip_address_to_binary/1]).
+                           amqp_to_mqtt/1]).
 -import(rabbit_misc, [maps_put_truthy/3]).
 
 -include_lib("kernel/include/logger.hrl").
@@ -342,6 +339,7 @@ connect_reason_code_to_return_code(_) ->
 
 process_connect(State0) ->
     maybe
+        ok ?= check_existing_subscriptions_topic_access(State0),
         {ok, QoS0SessPresent, State1} ?= handle_clean_start_qos0(State0),
         {ok, SessPresent, State2} ?= handle_clean_start_qos1(QoS0SessPresent, State1),
         {ok, State} ?= init_subscriptions(SessPresent, State2),
@@ -351,6 +349,29 @@ process_connect(State0) ->
     else
         {error, _} = Error ->
             Error
+    end.
+
+-spec check_existing_subscriptions_topic_access(state()) ->
+    ok | {error, reason_code()}.
+check_existing_subscriptions_topic_access(#state{cfg = #cfg{clean_start = true}}) ->
+    ok;
+%% The session queue is keyed on client ID, not the user, so a resume can't
+%% assume its subscriptions are still readable; reject the CONNECT and let
+%% the client retry with clean_start=true.
+check_existing_subscriptions_topic_access(#state{cfg = #cfg{exchange = Exchange}} = State) ->
+    QNames = existing_queue_names(State),
+    TopicFilters =
+    [amqp_to_mqtt(Key)
+     || QName <- QNames,
+        #binding{key = Key} <- rabbit_binding:list_for_source_and_destination(
+                                  Exchange, QName, _Reverse = true)],
+    case lists:all(fun(TopicFilter) ->
+                           check_topic_access(TopicFilter, read, State) =:= ok
+                   end, TopicFilters) of
+        true ->
+            ok;
+        false ->
+            {error, ?RC_NOT_AUTHORIZED}
     end.
 
 -spec process_packet(mqtt_packet(), state()) ->
@@ -561,11 +582,9 @@ process_request(?UNSUBSCRIBE,
     _ = send(Reply, State),
     {ok, State};
 
-process_request(?PINGREQ, #mqtt_packet{}, State = #state{cfg = #cfg{client_id = ClientId}}) ->
-    ?LOG_DEBUG("Received a PINGREQ from client ID ~s", [ClientId]),
+process_request(?PINGREQ, #mqtt_packet{}, State) ->
     Reply = #mqtt_packet{fixed = #mqtt_packet_fixed{type = ?PINGRESP}},
     _ = send(Reply, State),
-    ?LOG_DEBUG("Sent a PINGRESP to client ID ~s", [ClientId]),
     {ok, State};
 
 process_request(?DISCONNECT,
@@ -729,14 +748,6 @@ register_client_id(VHost, ClientId, CleanStart, WillProps)
                         ?MODULE,
                         remove_duplicate_client_id_connections,
                         [PgGroup, self(), SendWill]).
-
-%% remove_duplicate_client_id_connections/2 is only called from 3.13 nodes.
-%% Hence, this function can be deleted when mixed version clusters between
-%% this version and 3.13 are disallowed.
--spec remove_duplicate_client_id_connections(
-        {rabbit_types:vhost(), client_id()}, pid()) -> ok.
-remove_duplicate_client_id_connections(PgGroup, PidToKeep) ->
-    remove_duplicate_client_id_connections(PgGroup, PidToKeep, true).
 
 -spec remove_duplicate_client_id_connections(
         {rabbit_types:vhost(), client_id()}, pid(), boolean()) -> ok.
@@ -1265,7 +1276,7 @@ get_vhost_username(UserBin) ->
 
 get_vhost_from_user_mapping(User) ->
     UserVirtualHostMapping = rabbit_runtime_parameters:value_global(
-                               mqtt_default_vhosts
+                               <<"mqtt_default_vhosts">>
                               ),
     get_vhost_from_user_mapping(User, UserVirtualHostMapping).
 
@@ -1282,7 +1293,7 @@ get_vhost_from_user_mapping(User, Mapping) ->
 
 get_vhost_from_port_mapping(Port) ->
     PortVirtualHostMapping = rabbit_runtime_parameters:value_global(
-                               mqtt_port_to_vhost_mapping
+                               <<"mqtt_port_to_vhost_mapping">>
                               ),
     get_vhost_from_port_mapping(Port, PortVirtualHostMapping).
 
@@ -1943,7 +1954,12 @@ maybe_delete_mqtt_qos0_queue(
             case {amqqueue:get_type(Q), amqqueue:get_pid(Q)} of
                 {?QUEUE_TYPE_QOS_0, Pid}
                   when Pid =:= self() ->
-                    rabbit_queue_type:delete(Q, false, false, Username);
+                    case rabbit_queue_type:delete(Q, false, false, Username) of
+                        {ok, _} ->
+                            ok;
+                        {error, timeout} ->
+                            rabbit_mqtt_qos0_queue_cleanup:retry_delete(Q)
+                    end;
                 _ ->
                     ok
             end;

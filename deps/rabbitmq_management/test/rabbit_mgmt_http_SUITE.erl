@@ -112,7 +112,8 @@ definitions_group3_tests() ->
 
 definitions_group4_tests() ->
     [
-        definitions_vhost_test
+        definitions_vhost_test,
+        definitions_etag_test
     ].
 
 definitions_group5_tests() ->
@@ -152,6 +153,8 @@ all_tests() -> [
     adding_a_user_with_password_test,
     adding_a_user_with_password_hash_test,
     adding_a_user_with_generated_password_hash_test,
+    hash_password_get_is_deprecated_test,
+    hash_password_rejects_non_string_password_test,
     adding_a_user_with_permissions_in_single_operation_test,
     adding_a_user_without_tags_fails_test,
     adding_a_user_with_too_many_tags_fails_test,
@@ -169,15 +172,18 @@ all_tests() -> [
     quorum_queues_test,
     stream_queues_have_consumers_field,
     bindings_post_test,
+    bindings_post_non_object_body_test,
     bindings_null_routing_key_test,
     bindings_e2e_test,
     permissions_administrator_test,
     permissions_vhost_test,
+    permissions_vhost_existence_disclosure_test,
     permissions_amqp_test,
     permissions_queue_delete_test,
     permissions_connection_channel_consumer_test,
     consumers_cq_test,
     consumers_qq_test,
+    consumers_require_virtual_host_access_test,
     arguments_test,
     arguments_table_test,
     queue_purge_test,
@@ -225,7 +231,9 @@ all_tests() -> [
     single_active_consumer_qq_test,
     disable_basic_auth_test,
     login_test,
+    login_encrypted_test,
     csp_headers_test,
+    referrer_policy_headers_test,
     auth_attempts_test,
     user_limits_list_test,
     user_limit_set_test,
@@ -238,6 +246,7 @@ all_tests() -> [
     connections_amqpl,
     connections_amqp,
     amqp_sessions,
+    amqp_consumer_channel_details,
     amqpl_sessions,
     enable_plugin_amqp,
     cluster_and_node_tags_test,
@@ -386,6 +395,11 @@ end_per_testcase0(permissions_vhost_test, Config) ->
     rabbit_ct_broker_helpers:delete_vhost(Config, <<"myvhost2">>),
     rabbit_ct_broker_helpers:delete_user(Config, <<"myuser1">>),
     rabbit_ct_broker_helpers:delete_user(Config, <<"myuser2">>),
+    Config;
+end_per_testcase0(permissions_vhost_existence_disclosure_test, Config) ->
+    rabbit_ct_broker_helpers:delete_vhost(Config, <<"nfd_vhost">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"nfd_user">>),
+    rabbit_ct_broker_helpers:delete_user(Config, <<"nfd_policy_user">>),
     Config;
 end_per_testcase0(config_environment_test, Config) ->
     rpc(Config, application, unset_env, [rabbit, config_environment_test_env]),
@@ -673,18 +687,30 @@ users_test(Config) ->
     http_put(Config, "/users/users_test", [{password_hash,
                                         <<"IECV6PZI/Invh0DL187KFpkO5Jc=">>},
                                         {tags, <<"management">>}], {group, '2xx'}),
+    UserGet1 = http_get(Config, "/users/users_test"),
     assert_item(#{name => <<"users_test">>, tags => [<<"management">>],
-                    password_hash => <<"IECV6PZI/Invh0DL187KFpkO5Jc=">>,
+                    has_password => true,
                     hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
-                http_get(Config, "/users/users_test")),
+                UserGet1),
+    %% GET /api/users/:name must not expose the raw salt-and-hash.
+    ?assertNot(maps:is_key(password_hash, UserGet1)),
 
     http_put(Config, "/users/users_test", [{password_hash,
                                         <<"IECV6PZI/Invh0DL187KFpkO5Jc=">>},
                                         {hashing_algorithm, <<"rabbit_password_hashing_md5">>},
                                         {tags, [<<"management">>]}], {group, '2xx'}),
+    UserGet2 = http_get(Config, "/users/users_test"),
     assert_item(#{name => <<"users_test">>, tags => [<<"management">>],
-                    password_hash => <<"IECV6PZI/Invh0DL187KFpkO5Jc=">>,
+                    has_password => true,
                     hashing_algorithm => <<"rabbit_password_hashing_md5">>},
+                UserGet2),
+    ?assertNot(maps:is_key(password_hash, UserGet2)),
+
+    %% has_password lets the UI show "can log in with password" without
+    %% needing the hash itself.
+    http_put(Config, "/users/users_test", [{password_hash, <<"">>},
+                                        {tags, [<<"management">>]}], {group, '2xx'}),
+    assert_item(#{name => <<"users_test">>, has_password => false},
                 http_get(Config, "/users/users_test")),
     http_put(Config, "/users/users_test", [{password, <<"password">>},
                                         {tags, [<<"administrator">>, <<"foo">>]}], {group, '2xx'}),
@@ -692,6 +718,11 @@ users_test(Config) ->
                 http_get(Config, "/users/users_test")),
     Listed = lists:sort(http_get(Config, "/users")),
     ct:pal("Listed users: ~tp", [Listed]),
+    %% GET /api/users must not expose any user's raw salt-and-hash.
+    ?assertNot(lists:any(fun(U) -> maps:is_key(password_hash, U) end, Listed)),
+    ListedColumns = http_get(Config, "/users?columns=name,has_password", ?OK),
+    ?assert(lists:all(fun(U) -> lists:sort(maps:keys(U)) =:= [has_password, name] end,
+                      ListedColumns)),
     User1 = #{name => <<"users_test">>, tags => [<<"administrator">>, <<"foo">>]},
     User2 = #{name => <<"guest">>, tags => [<<"administrator">>]},
     ?assert(lists:any(fun(U) ->
@@ -815,15 +846,23 @@ adding_a_user_with_password_hash_test(Config) ->
     http_delete(Config, "/users/user11", ?NO_CONTENT).
 
 adding_a_user_with_generated_password_hash_test(Config) ->
-    #{ok := HashedPassword} = http_get(Config, "/auth/hash_password/some_password"),
+    #{ok := HashedPassword} = http_post(Config, "/auth/hash_password",
+                                         [{password, <<"some_password">>}],
+                                         ?OK),
 
     http_put(Config, "/users/user12", [{tags, <<"administrator">>},
                                        {password_hash, HashedPassword}],
              [?CREATED, ?NO_CONTENT]),
     % If the get succeeded, the hashed password generation is correct
     User = http_get(Config, "/users/user12", "user12", "some_password", ?OK),
-    ?assertEqual(maps:get(password_hash, User), HashedPassword),
+    ?assert(maps:get(has_password, User)),
     http_delete(Config, "/users/user12", ?NO_CONTENT).
+
+hash_password_get_is_deprecated_test(Config) ->
+    http_get(Config, "/auth/hash_password/some_password", ?NOT_FOUND).
+
+hash_password_rejects_non_string_password_test(Config) ->
+    http_post(Config, "/auth/hash_password", [{password, 12345}], ?BAD_REQUEST).
 
 adding_a_user_with_permissions_in_single_operation_test(Config) ->
     QArgs = #{durable => true},
@@ -910,13 +949,13 @@ adding_a_user_without_password_or_hash_test(Config) ->
     http_put(Config, "/users/no-pwd", [{tags, <<"management">>}], [?CREATED, ?NO_CONTENT]),
     assert_item(#{name              => <<"no-pwd">>,
                   tags              => [<<"management">>],
-                  password_hash     => <<>>,
+                  has_password      => false,
                   hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
                 http_get(Config, "/users/no-pwd")),
     http_put(Config, "/users/no-pwd", [{tags, <<"management">>}], [?CREATED, ?NO_CONTENT]),
     assert_item(#{name              => <<"no-pwd">>,
                   tags              => [<<"management">>],
-                  password_hash     => <<>>,
+                  has_password      => false,
                   hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
                 http_get(Config, "/users/no-pwd")),
     http_delete(Config, "/users/no-pwd", ?NO_CONTENT).
@@ -937,7 +976,7 @@ updating_a_user_without_password_or_hash_clears_password_test(Config) ->
     http_put(Config, "/users/myuser", [{tags,     <<"management">>}], [?CREATED, ?NO_CONTENT]),
     assert_item(#{name => <<"myuser">>,
                   tags => [<<"management">>],
-                  password_hash => <<>>,
+                  has_password => false,
                   hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
                 http_get(Config, "/users/myuser")),
     http_delete(Config, "/users/myuser", ?NO_CONTENT).
@@ -975,21 +1014,21 @@ updating_tags_of_a_passwordless_user_test(Config) ->
     http_put(Config, "/users/abc", [{tags,     <<"management">>}], [?CREATED, ?NO_CONTENT]),
     assert_item(#{name => ?NON_GUEST_USERNAME,
                   tags => [<<"management">>],
-                  password_hash => <<>>,
+                  has_password => false,
                   hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
                 http_get(Config, "/users/abc")),
 
     http_put(Config, "/users/abc", [{tags,     <<"impersonator">>}], [?CREATED, ?NO_CONTENT]),
     assert_item(#{name => ?NON_GUEST_USERNAME,
                   tags => [<<"impersonator">>],
-                  password_hash => <<>>,
+                  has_password => false,
                   hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
                 http_get(Config, "/users/abc")),
 
     http_put(Config, "/users/abc", [{tags,     <<"">>}], [?CREATED, ?NO_CONTENT]),
     assert_item(#{name => ?NON_GUEST_USERNAME,
                   tags => [],
-                  password_hash => <<>>,
+                  has_password => false,
                   hashing_algorithm => <<"rabbit_password_hashing_sha256">>},
                 http_get(Config, "/users/abc")),
 
@@ -1187,7 +1226,7 @@ connections_amqp(Config) ->
     after 5000 -> ct:fail(opened_timeout)
     end,
     eventually(?_assertEqual(1, length(http_get(Config, "/connections"))), 1000, 10),
-    ?assertEqual(1, length(rpc(Config, rabbit_amqp1_0, list_local, []))),
+    ?assertEqual(1, length(rpc(Config, rabbit_amqp_reader, local_connections, []))),
     [Connection1] = http_get(Config, "/connections"),
     ?assertMatch(#{node := Node,
                    vhost := <<"/">>,
@@ -1229,7 +1268,7 @@ connections_amqp(Config) ->
     end,
     eventually(?_assertNot(is_process_alive(C2))),
     eventually(?_assertEqual([], http_get(Config, "/connections")), 10, 5),
-    ?assertEqual(0, length(rpc(Config, rabbit_amqp1_0, list_local, []))).
+    ?assertEqual(0, length(rpc(Config, rabbit_amqp_reader, local_connections, []))).
 
 %% Test that AMQP 1.0 sessions and links can be listed via the rabbitmq_management plugin.
 amqp_sessions(Config) ->
@@ -1380,6 +1419,53 @@ amqp_sessions(Config) ->
     {ok, _} = rabbitmq_amqp_client:delete_queue(LinkPair, QName),
     ok = rabbitmq_amqp_client:detach_management_link_pair_sync(LinkPair),
     ok = amqp10_client:close_connection(C).
+
+%% Test that an AMQP 1.0 consumer is reported with the details of its
+%% connection: an AMQP 1.0 session is neither a channel nor a connection.
+amqp_consumer_channel_details(Config) ->
+    QName = <<"amqp-consumer-channel-details">>,
+    QPath = "/queues/%2F/" ++ binary_to_list(QName),
+    http_put(Config, QPath, [{durable, true}], {group, '2xx'}),
+    User = <<"amqp-consumer-user">>,
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User, <<"/">>),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    OpnConf = #{address => ?config(rmq_hostname, Config),
+                port => Port,
+                container_id => <<"my container">>,
+                sasl => {plain, User, User}},
+    {ok, C} = amqp10_client:open_connection(OpnConf),
+    receive {amqp10_event, {connection, C, opened}} -> ok
+    after 5000 -> ct:fail(opened_timeout)
+    end,
+    {ok, Session} = amqp10_client:begin_session_sync(C),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"my receiver">>,
+                       rabbitmq_amqp_address:queue(QName)),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 5000 -> ct:fail({missing_event, ?LINE})
+    end,
+
+    eventually(?_assertEqual(1, length(http_get(Config, "/connections"))), 1000, 10),
+    [#{name := ConnectionName}] = http_get(Config, "/connections"),
+    eventually(?_assertMatch(
+                  [#{channel_details := #{name := <<>>,
+                                          number := 0,
+                                          user := User,
+                                          connection_name := ConnectionName}}],
+                  http_get(Config, "/consumers")), 1000, 10),
+    ?assertMatch(#{consumer_details := [#{channel_details := #{name := <<>>,
+                                                               connection_name := ConnectionName}}]},
+                 http_get(Config, QPath)),
+    %% Users without the monitoring tag only see consumers of their own connections.
+    ?assertMatch([#{channel_details := #{connection_name := ConnectionName}}],
+                 http_get(Config, "/consumers", User, User, ?OK)),
+
+    ok = amqp10_client:detach_link(Receiver),
+    ok = amqp10_client:close_connection(C),
+    http_delete(Config, QPath, {group, '2xx'}),
+    rabbit_ct_broker_helpers:delete_user(Config, User).
 
 %% Test that GET /connections/:name/sessions returns
 %% 400 Bad Request for non-AMQP 1.0 connections.
@@ -1710,6 +1796,12 @@ bindings_post_test(Config) ->
     http_delete(Config, "/queues/%2F/myqueue", {group, '2xx'}),
     passed.
 
+bindings_post_non_object_body_test(Config) ->
+    Path = "/bindings/%2F/e/amq.direct/q/myqueue",
+    http_post_json(Config, Path, <<"[]">>, ?BAD_REQUEST),
+    http_post_json(Config, Path, <<"\"str\"">>, ?BAD_REQUEST),
+    passed.
+
 bindings_null_routing_key_test(Config) ->
     http_delete(Config, "/exchanges/%2F/myexchange", {one_of, [201, 404]}),
     XArgs = [{type, <<"direct">>}],
@@ -1882,6 +1974,60 @@ permissions_vhost_test(Config) ->
     http_delete(Config, "/users/myadmin", {group, '2xx'}),
     passed.
 
+permissions_vhost_existence_disclosure_test(Config) ->
+    QArgs = #{durable => true},
+    PermArgs = [{configure, <<".*">>}, {write, <<".*">>}, {read, <<".*">>}],
+    http_put(Config, "/users/nfd_user", [{password, <<"nfd_user">>},
+                                         {tags, <<"management">>}], {group, '2xx'}),
+    http_put(Config, "/vhosts/nfd_vhost", none, {group, '2xx'}),
+    http_put(Config, "/permissions/nfd_vhost/guest", PermArgs, {group, '2xx'}),
+    http_put(Config, "/queues/nfd_vhost/nfd_queue", QArgs, {group, '2xx'}),
+
+    GetBody = fun(Path) ->
+                      Body = http_get_no_decode(Config, Path, "nfd_user", "nfd_user",
+                                                 ?NOT_FOUND),
+                      rabbit_json:decode(Body)
+              end,
+    %% ExistingVhostNoPerm is rejected by `is_authorized/2`
+    %% before `resource_exists/2` runs.
+    ExistingVhostNoPerm = GetBody("/queues/nfd_vhost/nfd_queue"),
+    NonExistentVhost    = GetBody("/queues/does-not-exist-nfd-vhost/nfd_queue"),
+    ?assertEqual(<<"not_found">>, maps:get(<<"error">>, ExistingVhostNoPerm)),
+    ?assertEqual(ExistingVhostNoPerm, NonExistentVhost),
+
+    ReqBody = fun(User, Method, Path, Body) ->
+                      {ok, {{_, 404, _}, _, RespBody}} =
+                          req(Config, 0, Method, Path,
+                              [auth_header(User, User),
+                               {"content-type", "application/json"}],
+                              rabbit_json:encode(Body)),
+                      rabbit_json:decode(RespBody)
+              end,
+    NotFound = #{<<"error">> => <<"not_found">>, <<"reason">> => <<"Not Found">>},
+
+    ?assertEqual(NotFound, ReqBody("nfd_user", put, "/queues/nfd_vhost/some-other-queue", QArgs)),
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_user", put, "/queues/does-not-exist-nfd-vhost/some-other-queue",
+                         QArgs)),
+
+    ?assertEqual(NotFound, ReqBody("nfd_user", post, "/queues/nfd_vhost/nfd_queue/get", #{})),
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_user", post, "/queues/does-not-exist-nfd-vhost/nfd_queue/get", #{})),
+
+    http_put(Config, "/users/nfd_policy_user", [{password, <<"nfd_policy_user">>},
+                                                {tags, <<"policymaker">>}], {group, '2xx'}),
+    Policy = #{pattern => <<".*">>, definition => #{'max-length' => 1}},
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_policy_user", put, "/policies/nfd_vhost/nfd_policy", Policy)),
+    ?assertEqual(NotFound,
+                 ReqBody("nfd_policy_user", put,
+                         "/policies/does-not-exist-nfd-vhost/nfd_policy", Policy)),
+
+    http_delete(Config, "/vhosts/nfd_vhost", {group, '2xx'}),
+    http_delete(Config, "/users/nfd_user", {group, '2xx'}),
+    http_delete(Config, "/users/nfd_policy_user", {group, '2xx'}),
+    passed.
+
 permissions_amqp_test(Config) ->
     %% Just test that it works at all, not that it works in all possible cases.
     QArgs = #{durable => true},
@@ -2005,6 +2151,23 @@ consumers_cq_test(Config) ->
 consumers_qq_test(Config) ->
     consumers_test(Config, [{'x-queue-type', <<"quorum">>}]).
 
+consumers_require_virtual_host_access_test(Config) ->
+    VHost = <<"consumers-vh">>,
+    User = <<"consumers-user">>,
+    rabbit_ct_broker_helpers:add_vhost(Config, VHost),
+    rabbit_ct_broker_helpers:add_user(Config, User, User),
+    rabbit_ct_broker_helpers:set_user_tags(Config, 0, User, [management]),
+
+    http_get(Config, "/consumers/consumers-vh", User, User, ?NOT_FOUND),
+    http_get(Config, "/consumers/no-such-vhost", User, User, ?NOT_FOUND),
+
+    rabbit_ct_broker_helpers:set_full_permissions(Config, User, VHost),
+    [] = http_get(Config, "/consumers/consumers-vh", User, User, ?OK),
+
+    rabbit_ct_broker_helpers:delete_user(Config, User),
+    rabbit_ct_broker_helpers:delete_vhost(Config, VHost),
+    passed.
+
 consumers_test(Config, Args) ->
     QArgs = [{auto_delete, false}, {durable, true},
              {arguments, Args}],
@@ -2124,6 +2287,13 @@ defs(Config, Key, URI, CreateMethod, Args, DeleteFun) ->
     defs(Config, Key, URI, CreateMethod, Args, DeleteFun, DeleteFun).
 
 defs(Config, Key, URI, CreateMethod, Args, DeleteFun0, DeleteFun1) ->
+    defs(Config, Key, URI, CreateMethod, Args, Args, DeleteFun0, DeleteFun1).
+
+%% ExpectedAfterRecreate is separate from Args since GET doesn't
+%% necessarily echo back everything PUT accepted -- e.g. GET /users/:name
+%% doesn't return password_hash even though PUT accepts it.
+defs(Config, Key, URI, CreateMethod, Args, ExpectedAfterRecreate,
+     DeleteFun0, DeleteFun1) ->
     %% Create the item
     URI2 = create(Config, CreateMethod, URI, Args),
     %% Make sure it ends up in definitions
@@ -2135,7 +2305,7 @@ defs(Config, Key, URI, CreateMethod, Args, DeleteFun0, DeleteFun1) ->
 
     %% Post the definitions back, it should get recreated in correct form
     http_post(Config, "/definitions", Definitions, {group, '2xx'}),
-    assert_item(Args, http_get(Config, URI2, ?OK)),
+    assert_item(ExpectedAfterRecreate, http_get(Config, URI2, ?OK)),
 
     %% And delete it again
     DeleteFun1(URI2),
@@ -2179,7 +2349,13 @@ definitions_test(Config) ->
          #{name              => <<"myuser">>,
            password_hash     => <<"WAbU0ZIcvjTpxM3Q3SbJhEAM2tQ=">>,
            hashing_algorithm => <<"rabbit_password_hashing_sha256">>,
-           tags              => [<<"management">>]}),
+           tags              => [<<"management">>]},
+         %% GET /users/:name doesn't return password_hash.
+         #{name              => <<"myuser">>,
+           hashing_algorithm => <<"rabbit_password_hashing_sha256">>,
+           tags              => [<<"management">>]},
+         fun(URI2) -> http_delete(Config, URI2, {group, '2xx'}) end,
+         fun(URI2) -> http_delete(Config, URI2, {group, '2xx'}) end),
     defs(Config, vhosts, "/vhosts/myvhost", put,
          #{name => <<"myvhost">>}),
     defs(Config, permissions, "/permissions/%2F/guest", put,
@@ -2487,6 +2663,73 @@ definitions_large_streamed_test(Config) ->
     ?assert(is_map(maps:get(limits, Defs))),
 
     http_delete(Config, "/vhosts/" ++ VHost, {group, '2xx'}),
+    passed.
+
+definitions_etag_test(Config) ->
+    %% Conditional request support relies on the Khepri metadata store version.
+    case rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_khepri, metadata_store_version, []) of
+        unavailable ->
+            {skip, "metadata store version is unavailable (Khepri not enabled)"};
+        {ok, _} ->
+            definitions_etag_test0(Config)
+    end.
+
+definitions_etag_test0(Config) ->
+    http_put(Config, "/queues/%2F/etag-queue", #{durable => true}, {group, '2xx'}),
+
+    %% A regular request returns 200 with a (strong) ETag.
+    {ok, {{_, 200, _}, JsonHeaders, _}} =
+        req(Config, get, "/definitions", [auth_header("guest", "guest")]),
+    JsonETag = proplists:get_value("etag", JsonHeaders),
+    ?assert(JsonETag =/= undefined),
+
+    %% A different scope (single virtual host) yields a different ETag even
+    %% though the store version is identical.
+    {ok, {{_, 200, _}, VhostHeaders, _}} =
+        req(Config, get, "/definitions/%2F", [auth_header("guest", "guest")]),
+    VhostETag = proplists:get_value("etag", VhostHeaders),
+    ?assert(VhostETag =/= undefined),
+    ?assertNotEqual(JsonETag, VhostETag),
+
+    %% A different representation (BERT) also yields a different ETag.
+    {ok, {{_, 200, _}, BertHeaders, _}} =
+        req(Config, get, "/definitions",
+            [auth_header("guest", "guest"), {"accept", "application/bert"}]),
+    BertETag = proplists:get_value("etag", BertHeaders),
+    ?assert(BertETag =/= undefined),
+    ?assertNotEqual(JsonETag, BertETag),
+
+    %% A conditional request with the current ETag is answered with 304 and an
+    %% empty body, i.e. the definitions are not generated at all.
+    {ok, {{_, 304, _}, Headers304, Body304}} =
+        req(Config, get, "/definitions",
+            [auth_header("guest", "guest"), {"if-none-match", JsonETag}]),
+    ?assertEqual([], Body304),
+    ?assertEqual("no-cache", proplists:get_value("cache-control", Headers304)),
+
+    {ok, {{_, 304, _}, _, _}} =
+        req(Config, get, "/definitions/%2F",
+            [auth_header("guest", "guest"), {"if-none-match", VhostETag}]),
+
+    {ok, {{_, 400, _}, _, _}} =
+        req(Config, get, "/definitions/etag-non-existent-vhost",
+            [auth_header("guest", "guest"), {"if-none-match", JsonETag}]),
+
+    %% Changing the topology changes the ETag, so the same conditional request
+    %% now returns the full response with a fresh ETag. The ETag's version token
+    %% advances asynchronously, so poll until the request answers 200.
+    http_put(Config, "/queues/%2F/etag-queue-2", #{durable => true}, {group, '2xx'}),
+    {ok, {{_, 200, _}, FreshHeaders, _}} =
+        ?awaitMatch({ok, {{_, 200, _}, _, _}},
+                    req(Config, get, "/definitions",
+                        [auth_header("guest", "guest"), {"if-none-match", JsonETag}]),
+                    30000),
+    FreshETag = proplists:get_value("etag", FreshHeaders),
+    ?assert(FreshETag =/= undefined),
+    ?assertNotEqual(JsonETag, FreshETag),
+
+    http_delete(Config, "/queues/%2F/etag-queue", {group, '2xx'}),
+    http_delete(Config, "/queues/%2F/etag-queue-2", {group, '2xx'}),
     passed.
 
 definitions_password_test(Config) ->
@@ -3183,6 +3426,17 @@ samples_range_test(Config) ->
     http_get(Config, "/nodes?lengths_age=60&lengths_incr=1", ?OK),
     http_get(Config, "/nodes?lengths_age=6000&lengths_incr=1", ?BAD_REQUEST),
 
+    [SamplesRangeNode] = http_get(Config, "/nodes"),
+    SamplesRangeNodeName = binary_to_list(maps:get(name, SamplesRangeNode)),
+    http_get(Config, "/nodes/" ++ SamplesRangeNodeName ++ "?lengths_age=60&lengths_incr=1", ?OK),
+    http_get(Config, "/nodes/" ++ SamplesRangeNodeName ++ "?lengths_age=6000&lengths_incr=1", ?BAD_REQUEST),
+
+    %% Healthchecks
+    http_get(Config, "/healthchecks/node?lengths_age=60&lengths_incr=1", ?OK),
+    http_get(Config, "/healthchecks/node?lengths_age=6000&lengths_incr=1", ?BAD_REQUEST),
+    http_get(Config, "/healthchecks/node/" ++ SamplesRangeNodeName ++ "?lengths_age=60&lengths_incr=1", ?OK),
+    http_get(Config, "/healthchecks/node/" ++ SamplesRangeNodeName ++ "?lengths_age=6000&lengths_incr=1", ?BAD_REQUEST),
+
     %% Overview
     http_get(Config, "/overview?lengths_age=60&lengths_incr=1", ?OK),
     http_get(Config, "/overview?lengths_age=6000&lengths_incr=1", ?BAD_REQUEST),
@@ -3555,6 +3809,8 @@ definitions_multipart_non_json_extension_allowed_when_not_enforced_test(Config) 
 require_definition_json_extension_defaults_to_false_in_overview_test(Config) ->
     %% By default, require_definition_json_extension is false and must be reflected in the overview.
     Overview = http_get(Config, "/overview"),
+    Definitions = maps:get(definitions, Overview),
+    ?assertEqual(false, maps:get(require_definition_json_extension, Definitions)),
     ?assertEqual(false, maps:get(require_definition_json_extension, Overview)),
     passed.
 
@@ -3564,6 +3820,8 @@ require_definition_json_extension_enabled_in_overview_test(Config) ->
         [rabbitmq_management, require_definition_json_extension, true]),
     try
         Overview = http_get(Config, "/overview"),
+        Definitions = maps:get(definitions, Overview),
+        ?assertEqual(true, maps:get(require_definition_json_extension, Definitions)),
         ?assertEqual(true, maps:get(require_definition_json_extension, Overview)),
         passed
     after
@@ -4343,23 +4601,91 @@ version_test(Config) ->
 login_test(Config) ->
     http_put(Config, "/users/myuser", [{password, <<"myuser">>},
                                        {tags,     <<"management">>}], {group, '2xx'}),
-    %% Let's do a post without any other form of authorization
-    {ok, {{_, CodeAct, _}, Headers, _}} =
+    %% Successful login returns a structured token envelope and user object
+    {ok, {{_, 200, _}, Headers, Body}} =
         req(Config, 0, post, "/login",
             [{"content-type", "application/x-www-form-urlencoded"}],
             <<"username=myuser&password=myuser">>),
-    ?assertEqual(200, CodeAct),
     ?assert(not proplists:is_defined("set-cookie", Headers)),
+    Decoded = rabbit_json:decode(Body),
+    Token = maps:get(<<"token">>, Decoded),
+    ?assertEqual(<<"basic">>, maps:get(<<"type">>, Token)),
+    ?assertEqual(base64:encode(<<"myuser:myuser">>), maps:get(<<"value">>, Token)),
+    User = maps:get(<<"user">>, Decoded),
+    ?assertEqual(<<"myuser">>, maps:get(<<"name">>, User)),
 
-    %% Let's request a login with an unknown user
-    {ok, {{_, CodeAct2, _}, Headers2, _}} =
+    %% Unknown user returns 401 with no session cookie.
+    {ok, {{_, 401, _}, Headers2, _}} =
         req(Config, 0, post, "/login",
             [{"content-type", "application/x-www-form-urlencoded"}],
             <<"username=misteryusernumber1&password=myuser">>),
-    ?assertEqual(401, CodeAct2),
     ?assert(not proplists:is_defined("set-cookie", Headers2)),
 
     http_delete(Config, "/users/myuser", {group, '2xx'}),
+    passed.
+
+login_encrypted_test(Config) ->
+    rpc(Config, application, set_env,
+        [rabbitmq_management, credential_encryption_secret, <<"test-secret">>]),
+    http_put(Config, "/users/myuser", [{password, <<"myuser">>},
+                                       {tags,     <<"management">>}], {group, '2xx'}),
+    {ok, {{_, 200, _}, _, Body}} =
+        req(Config, 0, post, "/login",
+            [{"content-type", "application/x-www-form-urlencoded"}],
+            <<"username=myuser&password=myuser">>),
+    Decoded = rabbit_json:decode(Body),
+    Token = maps:get(<<"token">>, Decoded),
+    ?assertEqual(<<"bearer">>, maps:get(<<"type">>, Token)),
+    Value = maps:get(<<"value">>, Token),
+    ?assertMatch(<<"rmqe.", _/binary>>, Value),
+
+    %% The encrypted token authenticates a subsequent API call.
+    {ok, {{_, 200, _}, _, _}} =
+        req(Config, get, "/whoami",
+            [{"authorization", "Bearer " ++ binary_to_list(Value)}]),
+
+    %% Force the session timeout to 0 minutes and issue a new token
+    rpc(Config, application, set_env,
+        [rabbitmq_management, login_session_timeout, 0]),
+
+    {ok, {{_, 200, _}, _, Body2}} =
+        req(Config, 0, post, "/login",
+            [{"content-type", "application/x-www-form-urlencoded"}],
+            <<"username=myuser&password=myuser">>),
+    Decoded2 = rabbit_json:decode(Body2),
+    Token2 = maps:get(<<"token">>, Decoded2),
+    Value2 = maps:get(<<"value">>, Token2),
+
+    %% Wait 1.5 seconds to ensure Now > ExpiresAt (which was Now + 0 at issue time)
+    timer:sleep(1500),
+
+    %% Now the new token should be expired
+    {ok, {{_, 401, _}, _, ErrBody}} =
+        req(Config, get, "/whoami",
+            [{"authorization", "Bearer " ++ binary_to_list(Value2)}]),
+    ErrDecoded = rabbit_json:decode(ErrBody),
+    ?assertEqual(<<"Invalid token: expired">>, maps:get(<<"reason">>, ErrDecoded)),
+
+    %% However, the OLD token should STILL be valid because its Expiration was
+    %% fixed at 8 hours at issue time. Changing the global config did not affect it.
+    {ok, {{_, 200, _}, _, _}} =
+        req(Config, get, "/whoami",
+            [{"authorization", "Bearer " ++ binary_to_list(Value)}]),
+
+    %% Reset timeout
+    rpc(Config, application, unset_env,
+        [rabbitmq_management, login_session_timeout]),
+
+    %% Standard Basic auth must also be accepted when encryption is enabled,
+    %% because non-UI clients (curl, REST apps, etc.) always use Basic.
+    BasicValue = base64:encode(<<"myuser:myuser">>),
+    {ok, {{_, 200, _}, _, _}} =
+        req(Config, get, "/whoami",
+            [{"authorization", "Basic " ++ binary_to_list(BasicValue)}]),
+
+    http_delete(Config, "/users/myuser", {group, '2xx'}),
+    rpc(Config, application, unset_env,
+        [rabbitmq_management, credential_encryption_secret]),
     passed.
 
 csp_headers_test(Config) ->
@@ -4369,6 +4695,19 @@ csp_headers_test(Config) ->
     ?assert(lists:keymember("content-security-policy", 1, HdGetCsp0)),
     {ok, {_, HdGetCsp1, _}} = req(Config, get_static, "/index.html", Headers),
     ?assert(lists:keymember("content-security-policy", 1, HdGetCsp1)).
+
+referrer_policy_headers_test(Config) ->
+    AuthHeader = auth_header("guest", "guest"),
+    rpc(Config, application, set_env,
+        [rabbitmq_management, headers, [{referrer_policy, "no-referrer"}]]),
+    {ok, {_, Hd0, _}} = req(Config, get, "/whoami", [AuthHeader]),
+    ?assertEqual("no-referrer",
+                 proplists:get_value("referrer-policy", Hd0)),
+    rpc(Config, application, set_env,
+        [rabbitmq_management, headers, []]),
+    {ok, {_, Hd1, _}} = req(Config, get, "/whoami", [AuthHeader]),
+    ?assertEqual(undefined,
+                 proplists:get_value("referrer-policy", Hd1)).
 
 disable_basic_auth_test(Config) ->
     rpc(Config, application, set_env, [rabbitmq_management, disable_basic_auth, true]),

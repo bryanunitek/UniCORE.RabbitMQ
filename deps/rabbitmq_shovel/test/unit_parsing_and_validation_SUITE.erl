@@ -9,6 +9,7 @@
 
 -compile(export_all).
 
+-include_lib("proper/include/proper.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
 -define(EXCHANGE,    <<"test_exchange">>).
@@ -28,7 +29,12 @@ groups() ->
       {tests, [parallel], [
           parse_amqp091,
           parse_amqp10_mixed,
-          parse_local
+          parse_local,
+          parse_delete_after,
+          source_without_declarations_is_arity_compatible,
+          source_with_declarations_is_arity_compatible,
+          destination_without_declarations_is_arity_compatible,
+          prop_source_decl_fun_is_arity_compatible
         ]}
     ].
 
@@ -87,7 +93,7 @@ parse_amqp091(_Config) ->
                    uris := [{encrypted, _}],
                    fields_fun := _PubFields,
                    props_fun := _PubProps,
-                   resource_decl := _DDecl,
+                   resource_decl := {rabbit_amqp091_shovel, decl_fun, [[]]},
                    add_timestamp_header := false,
                    add_forward_headers := true},
          source := #{module := rabbit_amqp091_shovel,
@@ -95,7 +101,7 @@ parse_amqp091(_Config) ->
                      queue := <<"the-queue">>,
                      prefetch_count := 10,
                      delete_after := never,
-                     resource_decl := _SDecl}},
+                     resource_decl := {rabbit_amqp091_shovel, decl_fun, [[]]}}},
         Parsed),
     assert_uris_round_trip(Parsed,
                            ["ampq://myhost:5672/vhost"],
@@ -172,7 +178,7 @@ parse_local(_Config) ->
                 uris := [{encrypted, _}],
                 exchange := none,
                 routing_key := none,
-                resource_decl := _DDecl,
+                resource_decl := {rabbit_local_shovel, decl_fun, [[]]},
                 add_timestamp_header := false,
                 add_forward_headers := true},
             source := #{
@@ -181,7 +187,7 @@ parse_local(_Config) ->
                 queue := <<"the-queue">>,
                 consumer_args := [],
                 delete_after := never,
-                resource_decl := _SDecl}},
+                resource_decl := {rabbit_local_shovel, decl_fun, [[]]}}},
         Parsed),
     assert_uris_round_trip(Parsed,
                            ["ampq://myhost:5672/vhost"],
@@ -193,3 +199,81 @@ assert_uris_round_trip(#{source := #{uris := SrcUris},
                        ExpectedSrcUris, ExpectedDestUris) ->
     ?assertEqual(ExpectedSrcUris, rabbit_shovel_util:deobfuscate_uris(SrcUris)),
     ?assertEqual(ExpectedDestUris, rabbit_shovel_util:deobfuscate_uris(DestUris)).
+
+parse_delete_after(_Config) ->
+    ?assertEqual(never, rabbit_shovel_util:parse_delete_after(<<"never">>)),
+    ?assertEqual('queue-length',
+                 rabbit_shovel_util:parse_delete_after(<<"queue-length">>)),
+    ?assertEqual(0, rabbit_shovel_util:parse_delete_after(0)),
+    ?assertEqual(42, rabbit_shovel_util:parse_delete_after(42)),
+    %% A value rejected by rabbit_shovel_util:validate_delete_after/2 must not
+    %% be turned into a new atom.
+    Unexpected = <<"delete-after-value-that-is-not-a-valid-atom-yet">>,
+    ?assertError(function_clause,
+                 rabbit_shovel_util:parse_delete_after(Unexpected)),
+    ?assertError(badarg, binary_to_existing_atom(Unexpected, utf8)),
+    ok.
+
+%% Regression: an empty argument list resolved to a lower, non-existent arity
+%% once the connection context was appended.
+source_without_declarations_is_arity_compatible(_Config) ->
+    [begin
+         Endpoint = {source, [{queue, <<"a-queue">>}]},
+         MFA = rabbit_shovel_util:decl_fun(Mod, Endpoint),
+         ?assertEqual({Mod, decl_fun, [[]]}, MFA),
+         assert_applicable(MFA)
+     end || Mod <- [rabbit_amqp091_shovel, rabbit_local_shovel]],
+    ok.
+
+source_with_declarations_is_arity_compatible(_Config) ->
+    [begin
+         Endpoint = {source, [{queue, <<"a-queue">>},
+                              {declarations,
+                               [{'queue.declare', [{queue, <<"a-queue">>}]}]}]},
+         MFA = rabbit_shovel_util:decl_fun(Mod, Endpoint),
+         ?assertMatch({Mod, decl_fun, [[_ | _]]}, MFA),
+         assert_applicable(MFA)
+     end || Mod <- [rabbit_amqp091_shovel, rabbit_local_shovel]],
+    ok.
+
+destination_without_declarations_is_arity_compatible(_Config) ->
+    [begin
+         Endpoint = {destination, []},
+         MFA = rabbit_shovel_util:decl_fun(Mod, Endpoint),
+         ?assertEqual({Mod, decl_fun, [[]]}, MFA),
+         assert_applicable(MFA)
+     end || Mod <- [rabbit_amqp091_shovel, rabbit_local_shovel]],
+    ok.
+
+%% Any declaration count resolves to a single-argument MFA, exported at the
+%% arity the backend applies.
+prop_source_decl_fun_is_arity_compatible(_Config) ->
+    Prop =
+        ?FORALL({Mod, Decls},
+                {oneof([rabbit_amqp091_shovel, rabbit_local_shovel]),
+                 declarations_gen()},
+                begin
+                    Endpoint = {source, [{queue, <<"a-queue">>},
+                                         {declarations, Decls}]},
+                    {M, F, Args} = rabbit_shovel_util:decl_fun(Mod, Endpoint),
+                    length(Args) =:= 1 andalso
+                        lists:member({F, length(Args) + context_arity(M)},
+                                     M:module_info(exports))
+                end),
+    ?assert(proper:quickcheck(Prop, [{numtests, 200}, {to_file, user}])).
+
+declarations_gen() ->
+    list(oneof([{'queue.declare',    [{queue, non_empty_binary()}]},
+                {'exchange.declare', [{exchange, non_empty_binary()}]}])).
+
+non_empty_binary() ->
+    ?LET(Chars, non_empty(list(range($a, $z))), list_to_binary(Chars)).
+
+%% Backends append their connection context, so the target must be exported at
+%% length(Args) plus that context's arity.
+assert_applicable({Mod, Fun, Args}) ->
+    Arity = length(Args) + context_arity(Mod),
+    ?assert(lists:member({Fun, Arity}, Mod:module_info(exports))).
+
+context_arity(rabbit_amqp091_shovel) -> 2;
+context_arity(rabbit_local_shovel)   -> 3.

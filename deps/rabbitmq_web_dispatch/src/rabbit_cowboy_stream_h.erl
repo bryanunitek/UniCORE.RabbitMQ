@@ -39,7 +39,7 @@ info(StreamId, Response, State = #state{next = Next, req = Req}) ->
             log_response(Response, Req),
             H1 = unset_authenticated_username(Headers0),
             Json = rabbit_json:encode(#{
-                error  => list_to_binary(httpd_util:reason_phrase(404)),
+                error  => not_found,
                 reason => <<"Not Found">>}),
             H2 = maps:put(<<"content-length">>, integer_to_list(iolist_size(Json)), H1),
             H3 = maps:put(<<"content-type">>, <<"application/json">>, H2),
@@ -121,7 +121,7 @@ body_length({sendfile, _, Length, _}) -> Length;
 body_length(Body) -> iolist_size(Body).
 
 fmt_ip(IP) when is_tuple(IP) ->
-    inet_parse:ntoa(IP).
+    rabbit_misc:ntoa(IP).
 
 format_time() ->
     {{Year, Month, Date}, {Hour, Min, Sec}} = calendar:local_time(),

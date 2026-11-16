@@ -37,7 +37,7 @@
          close_source/1,
          close_dest/1,
          ack/3,
-         nack/3,
+         nack/2,
          status/1,
          forward/3,
          pending_count/1
@@ -96,6 +96,7 @@ parse(_Name, {source, Source}) ->
       resource_decl => rabbit_shovel_util:decl_fun(?MODULE, {source, Source}),
       queue => Queue,
       delete_after => proplists:get_value(delete_after, Source, never),
+      delete_after_duration => proplists:get_value(delete_after_duration, Source, undefined),
       prefetch_count => Prefetch,
       consumer_args => CArgs,
       consumer_name => CTag};
@@ -142,6 +143,7 @@ parse_source(Def) ->
     end,
     DeleteAfter = pget(<<"src-delete-after">>, Def,
                        pget(<<"delete-after">>, Def, <<"never">>)),
+    DeleteAfterDuration = pget(<<"src-delete-after-duration">>, Def, undefined),
     PrefetchCount = pget(<<"src-prefetch-count">>, Def,
                          pget(<<"prefetch-count">>, Def, 1000)),
     %% Details are only used for status report in rabbitmqctl, as vhost is not
@@ -153,7 +155,8 @@ parse_source(Def) ->
                   uris => SrcURIs,
                   resource_decl => SrcDeclFun,
                   queue => Queue,
-                  delete_after => opt_b2a(DeleteAfter),
+                  delete_after => rabbit_shovel_util:parse_delete_after(DeleteAfter),
+                  delete_after_duration => DeleteAfterDuration,
                   prefetch_count => PrefetchCount,
                   consumer_args => SrcCArgs,
                   consumer_name => SrcCTag
@@ -242,6 +245,7 @@ validate_src_funs(_Def, User) ->
      {<<"delete-after">>, fun rabbit_shovel_util:validate_delete_after/2, optional},
      %% currently used multi-protocol friend name, introduced in 3.7
      {<<"src-delete-after">>, fun rabbit_shovel_util:validate_delete_after/2, optional},
+     {<<"src-delete-after-duration">>, fun rabbit_shovel_util:validate_delete_after_duration/2, optional},
      {<<"src-predeclared">>,  fun rabbit_parameter_validation:boolean/2, optional}
     ].
 
@@ -265,7 +269,8 @@ connect_source(Conf = #{name := Name,
     {Conn, Chan, Uri} = make_conn_and_chan(deobfuscate_uris(Uris), Name),
     Conf#{source => Src#{current => {Conn, Chan, Uri}}}.
 
-init_source(Conf = #{ack_mode := AckMode,
+init_source(Conf = #{name := Name,
+                     ack_mode := AckMode,
                      source := #{queue := Queue,
                                  current := {Conn, Chan, _},
                                  prefetch_count := Prefetch,
@@ -293,8 +298,9 @@ init_source(Conf = #{ack_mode := AckMode,
                                                       consumer_tag = CTag,
                                                       no_ack = NoAck,
                                                       arguments = Args}, self()),
-    Conf#{source => Src#{remaining => Remaining,
-                         remaining_unacked => Remaining}}.
+    Src1 = Src#{remaining => Remaining,
+                remaining_unacked => Remaining},
+    Conf#{source => rabbit_shovel_util:sched_expire_after_duration(Name, Src1)}.
 
 connect_dest(Conf = #{name := Name, dest := #{uris := Uris} = Dst}) ->
     {Conn, Chan, URI} = make_conn_and_chan(deobfuscate_uris(Uris), Name),
@@ -322,10 +328,13 @@ ack(Tag, Multi, State = #{source := #{current := {_, Chan, _}}}) ->
                                               multiple = Multi}),
     State.
 
-nack(Tag, Multi, State = #{source := #{current := {_, Chan, _}}}) ->
-     ok = amqp_channel:cast(Chan, #'basic.nack'{delivery_tag = Tag,
-                                                multiple = Multi}),
-     State.
+%% Unlike `basic.nack`, `basic.reject` increments the delivery-count.
+nack(Tags, State = #{source := #{current := {_, Chan, _}}}) ->
+    lists:foreach(fun(Tag) ->
+                          ok = amqp_channel:cast(Chan, #'basic.reject'{delivery_tag = Tag,
+                                                                       requeue = true})
+                  end, Tags),
+    State.
 
 source_uri(#{source := #{current := {_, _, Uri}}}) -> Uri.
 dest_uri(#{dest := #{current := {_, _, Uri}}}) -> Uri.
@@ -418,28 +427,36 @@ handle_source(#'basic.cancel'{}, #{name := Name}) ->
 
 handle_source({'EXIT', Conn, Reason},
               #{source := #{current := {Conn, _, _}}}) ->
-    {stop, {inbound_conn_died, Reason}};
+    {stop, {inbound_conn_died, unwrap_shutdown(Reason)}};
 
 handle_source({'EXIT', _Pid, {shutdown, {server_initiated_close, _, Reason}}}, _State) ->
     {stop, {inbound_link_or_channel_closure, Reason}};
 
+handle_source({internal, delete_after_duration_expired}, _State) ->
+    {stop, {shutdown, autodelete}};
+
 handle_source(_Msg, _State) ->
     not_handled.
 
+%% The Erlang AMQP 0-9-1 client wraps expected connection failures
+%% (e.g. `heartbeat_timeout`) in 'shutdown' to avoid massive
+%% supervisor reports logged. Unwrap them so that the specific reason is
+%% matched and logged by `rabbit_shovel_worker`.
+unwrap_shutdown({shutdown, Reason}) -> Reason;
+unwrap_shutdown(Reason)             -> Reason.
+
 handle_dest(#'basic.ack'{delivery_tag = Seq, multiple = Multiple},
             State = #{ack_mode := on_confirm}) ->
-    confirm_to_inbound(fun (Tag, Multi, StateX) ->
-                               rabbit_shovel_behaviour:ack(Tag, Multi, StateX)
+    confirm_to_inbound(fun (InTags, StateX) ->
+                               rabbit_shovel_behaviour:ack(lists:last(InTags), Multiple, StateX)
                        end, Seq, Multiple, State);
 
 handle_dest(#'basic.nack'{delivery_tag = Seq, multiple = Multiple},
             State = #{ack_mode := on_confirm }) ->
-    confirm_to_inbound(fun (Tag, Multi, StateX) ->
-                               rabbit_shovel_behaviour:nack(Tag, Multi, StateX)
-                       end, Seq, Multiple, State);
+    confirm_to_inbound(fun rabbit_shovel_behaviour:nack/2, Seq, Multiple, State);
 
 handle_dest({'EXIT', Conn, Reason}, #{dest := #{current := {Conn, _, _}}}) ->
-    {stop, {outbound_conn_died, Reason}};
+    {stop, {outbound_conn_died, unwrap_shutdown(Reason)}};
 
 handle_dest({'EXIT', _Pid, {shutdown, {server_initiated_close, _, Reason}}}, _State) ->
     {stop, {outbound_link_or_channel_closure, Reason}};
@@ -461,29 +478,36 @@ handle_dest({bump_credit, Msg}, State) ->
 handle_dest(_Msg, _State) ->
     not_handled.
 
-close_source(#{source := #{current := {Conn, Ch, _}}}) ->
-    catch amqp_channel:close(Ch),
-    catch amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT),
+close_source(#{source := #{current := {Conn, Ch, _}} = Src}) ->
+    _ = rabbit_shovel_util:cancel_expire_after_duration(Src),
+    _ = try amqp_channel:close(Ch) catch _:_ -> ok end,
+    _ = try amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT) catch _:_ -> ok end,
     ok;
 close_source(_) ->
     %% It never connected, connection doesn't exist
     ok.
 
 close_dest(#{dest := #{current := {Conn, Ch, _}}}) ->
-    catch amqp_channel:close(Ch),
-    catch amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT),
+    _ = try amqp_channel:close(Ch) catch _:_ -> ok end,
+    _ = try amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT) catch _:_ -> ok end,
     ok;
 close_dest(_) ->
     %% It never connected, connection doesn't exist
     ok.
 
 confirm_to_inbound(ConfirmFun, Seq, Multiple,
-                   State0 = #{dest := #{unacked := Unacked} = Dst}) ->
-    #{Seq := InTag} = Unacked,
-    {Unacked1, Removed} = remove_delivery_tags(Seq, Multiple, Unacked, 0),
-    State = ConfirmFun(InTag, Multiple, State0#{dest =>
-                                                    Dst#{unacked => Unacked1}}),
-    rabbit_shovel_behaviour:decr_remaining(Removed, State).
+                   State0 = #{name := Name,
+                              dest := #{unacked := Unacked} = Dst}) ->
+    case Unacked of
+        #{Seq := _} ->
+            {InTags, Unacked1} = take_inbound_tags(Seq, Multiple, Unacked),
+            State = ConfirmFun(InTags, State0#{dest => Dst#{unacked => Unacked1}}),
+            rabbit_shovel_behaviour:decr_remaining(length(InTags), State);
+        _ ->
+            ?LOG_WARNING("Shovel ~ts amqp0-9-1 destination confirm for an unknown "
+                         "delivery tag: ~tp", [Name, Seq]),
+            State0
+    end.
 
 publish(_Tag, _Method, _Msg, State = #{source := #{remaining_unacked := 0}}) ->
     %% We are in on-confirm mode, and are autodelete. We have
@@ -564,12 +588,12 @@ pop_pending(State = #{dest := Dest}) ->
     end.
 
 make_conn_and_chan([], {VHost, Name} = _ShovelName) ->
-    ?LOG_ERROR(
+    ?LOG_WARNING(
           "Shovel '~ts' in vhost '~ts' has no more URIs to try for connection",
           [Name, VHost]),
     erlang:error(failed_to_connect_using_provided_uris);
 make_conn_and_chan([], ShovelName) ->
-    ?LOG_ERROR(
+    ?LOG_WARNING(
           "Shovel '~ts' has no more URIs to try for connection",
           [ShovelName]),
     erlang:error(failed_to_connect_using_provided_uris);
@@ -577,7 +601,7 @@ make_conn_and_chan(URIs, ShovelName) ->
     try do_make_conn_and_chan(URIs, ShovelName) of
         Val -> Val
     catch throw:{error, Reason, URI} ->
-        log_connection_failure(Reason, URI, ShovelName),
+        rabbit_shovel_util:log_connection_failure(Reason, URI, ShovelName),
         make_conn_and_chan(lists:usort(URIs -- [URI]), ShovelName)
     end.
 
@@ -597,38 +621,6 @@ do_make_conn_and_chan(URIs, ShovelName) ->
             throw({error, Reason, URI})
     end.
 
-log_connection_failure(Reason, URI, {VHost, Name} = _ShovelName) ->
-    ?LOG_ERROR(
-          "Shovel '~ts' in vhost '~ts' failed to connect (URI: ~ts): ~ts",
-      [Name, VHost, amqp_uri:remove_credentials(URI), human_readable_connection_error(Reason)]);
-log_connection_failure(Reason, URI, ShovelName) ->
-    ?LOG_ERROR(
-          "Shovel '~ts' failed to connect (URI: ~ts): ~ts",
-          [ShovelName, amqp_uri:remove_credentials(URI), human_readable_connection_error(Reason)]).
-
-human_readable_connection_error({auth_failure, Msg}) ->
-    Msg;
-human_readable_connection_error(not_allowed) ->
-    "access to target virtual host was refused";
-human_readable_connection_error(unknown_host) ->
-    "unknown host (failed to resolve hostname)";
-human_readable_connection_error(econnrefused) ->
-    "connection to target host was refused (ECONNREFUSED)";
-human_readable_connection_error(econnreset) ->
-    "connection to target host was reset by peer (ECONNRESET)";
-human_readable_connection_error(etimedout) ->
-    "connection to target host timed out (ETIMEDOUT)";
-human_readable_connection_error(ehostunreach) ->
-    "target host is unreachable (EHOSTUNREACH)";
-human_readable_connection_error(nxdomain) ->
-    "target hostname cannot be resolved (NXDOMAIN)";
-human_readable_connection_error(eacces) ->
-    "connection to target host failed with EACCES. "
-    "This may be due to insufficient RabbitMQ process permissions or "
-    "a reserved IP address used as destination";
-human_readable_connection_error(Other) ->
-    rabbit_misc:format("~tp", [Other]).
-
 get_connection_name(ShovelName) when is_atom(ShovelName) ->
     Prefix = <<"Shovel ">>,
     ShovelNameAsBinary = atom_to_binary(ShovelName, utf8),
@@ -641,17 +633,16 @@ get_connection_name(ShovelName) when is_binary(ShovelName) ->
 get_connection_name(_) ->
     <<"Shovel">>.
 
-remove_delivery_tags(Seq, false, Unacked, 0) ->
-    {maps:remove(Seq, Unacked), 1};
-remove_delivery_tags(Seq, true, Unacked, Count) ->
-    case maps:size(Unacked) of
-        0  -> {Unacked, Count};
-        _ ->
-            maps:fold(fun(K, _V, {Acc, Cnt}) when K =< Seq ->
-                              {maps:remove(K, Acc), Cnt + 1};
-                         (_K, _V, Acc) -> Acc
-                      end, {Unacked, 0}, Unacked)
-    end.
+take_inbound_tags(Seq, false, Unacked) ->
+    {InTag, Unacked1} = maps:take(Seq, Unacked),
+    {[InTag], Unacked1};
+take_inbound_tags(Seq, true, Unacked) ->
+    {Taken, Unacked1} = maps:fold(fun(K, V, {T, U}) when K =< Seq ->
+                                          {[{K, V} | T], maps:remove(K, U)};
+                                     (_K, _V, Acc) ->
+                                          Acc
+                                  end, {[], Unacked}, Unacked),
+    {[InTag || {_, InTag} <- lists:keysort(1, Taken)], Unacked1}.
 
 remaining(_Ch, #{source := #{delete_after := never}}) ->
     unlimited;
@@ -758,12 +749,12 @@ parse_binary(Binary) when is_binary(Binary) ->
 parse_binary(NotABinary) ->
     fail({require_binary, NotABinary}).
 
+%% `validate_properties/2` and the 'P_basic' field names restrict the
+%% set of possible values, therefore the use of `binary_to_existing_atom/2`
+%% is safe.
 lookup_indices(KVs0, L) ->
     KVs = rabbit_data_coercion:to_proplist(KVs0),
-    [{1 + list_find(list_to_atom(binary_to_list(K)), L), V} || {K, V} <- KVs].
-
-opt_b2a(B) when is_binary(B) -> list_to_atom(binary_to_list(B));
-opt_b2a(N)                   -> N.
+    [{1 + list_find(binary_to_existing_atom(K, utf8), L), V} || {K, V} <- KVs].
 
 list_find(K, L) -> list_find(K, L, 1).
 
@@ -805,10 +796,10 @@ ensure_queue(Conn, Queue, XArgs) ->
             amqp_channel:call(Ch2, #'queue.declare'{queue     = Queue,
                                                     durable   = true,
                                                     arguments = XArgs}),
-            catch amqp_channel:close(Ch2)
+            try amqp_channel:close(Ch2) catch _:_ -> ok end
 
     after
-        catch amqp_channel:close(Ch)
+        _ = try amqp_channel:close(Ch) catch _:_ -> ok end
     end.
 
 check_queue(Conn, Queue, _XArgs) ->
@@ -817,7 +808,7 @@ check_queue(Conn, Queue, _XArgs) ->
         amqp_channel:call(Ch, #'queue.declare'{queue   = Queue,
                                                passive = true})
     after
-        catch amqp_channel:close(Ch)
+        _ = try amqp_channel:close(Ch) catch _:_ -> ok end
     end.
 
 fields_fun(X, Key, _SrcURI, _DestURI, P0) ->

@@ -184,6 +184,24 @@ end}.
 
 
 
+{mapping, "management.listeners.tcp.$name", "rabbitmq_management.tcp_listeners",
+    [{datatype, [integer, ip]}]}.
+
+{translation, "rabbitmq_management.tcp_listeners",
+fun(Conf) ->
+    Settings = cuttlefish_variable:filter_by_prefix("management.listeners.tcp", Conf),
+    [V || {_, V} <- Settings]
+end}.
+
+{mapping, "management.listeners.ssl.$name", "rabbitmq_management.ssl_listeners",
+    [{datatype, [integer, ip]}]}.
+
+{translation, "rabbitmq_management.ssl_listeners",
+fun(Conf) ->
+    Settings = cuttlefish_variable:filter_by_prefix("management.listeners.ssl", Conf),
+    [V || {_, V} <- Settings]
+end}.
+
 %% Legacy listener options ========================================================
 
 %% Legacy (pre-3.7.9) TCP listener format.
@@ -503,6 +521,13 @@ end}.
 
 {mapping, "management.disable_basic_auth", "rabbitmq_management.disable_basic_auth",
     [{datatype, boolean}]}.
+
+%% When set, the management UI stores an AES-256-GCM encrypted bearer token
+%% (prefixed "rmqe.") instead of a plaintext base64(username:password).
+%% The value must be identical on every node in the cluster.
+{mapping, "management.credential_encryption_secret",
+          "rabbitmq_management.credential_encryption_secret",
+    [{datatype, [tagged_binary, binary]}]}.
 
 %% Management only
 

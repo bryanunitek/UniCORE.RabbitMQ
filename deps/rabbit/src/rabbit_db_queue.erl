@@ -61,7 +61,7 @@
 
 %% Used by other rabbit_db_* modules
 -export([
-         update_in_khepri_tx/2,
+         update_in_khepri_tx/3,
          get_in_khepri_tx/1
         ]).
 
@@ -322,7 +322,7 @@ delete_if(QueueName, Conditions, OnlyDurable) ->
         true ->
             case rabbit_khepri:adv_delete(Pattern) of
                 {ok, #{Path := #{data := _}} = Deleted} ->
-                    rabbit_db_binding:khepri_ret_to_deletions(
+                    rabbit_db_binding:node_props_to_deletions(
                       Deleted, OnlyDurable);
                 {ok, _} ->
                     ok;
@@ -870,9 +870,13 @@ do_delete_transient_queues_in_khepri_tx([{Path, Vsn, QName} | Rest], Acc) ->
                                   false
                           end,
     case khepri_tx_adv:delete(VersionedPath) of
-        {ok, #{Path := #{data := _}}} when UsesUniformWriteRet ->
-            Deletions = rabbit_db_binding:delete_for_destination_in_khepri(
-                          QName, false),
+        {ok, #{Path := #{data := _}} = Deleted} when UsesUniformWriteRet ->
+            %% See rabbitmq/rabbitmq-server#17255
+            Deletions = rabbit_binding:combine_deletions(
+                          rabbit_db_binding:node_props_to_deletions_in_khepri_tx(
+                            Deleted, false),
+                          rabbit_db_binding:delete_for_destination_in_khepri(
+                            QName, false)),
             Acc1 = [{QName, Deletions} | Acc],
             do_delete_transient_queues_in_khepri_tx(Rest, Acc1);
         {ok, #{data := _}} when not UsesUniformWriteRet ->
@@ -960,19 +964,22 @@ set_dirty(_Q) ->
 %% update_in_khepri_tx().
 %% -------------------------------------------------------------------
 
--spec update_in_khepri_tx(QName, UpdateFun) -> Ret when
-      QName :: rabbit_amqqueue:name(),
+-spec update_in_khepri_tx(VHost, QName, UpdateFun) -> Ret when
+      VHost :: vhost:name(),
+      QName :: khepri_path:pattern_component(),
       Queue :: amqqueue:amqqueue(),
       UpdateFun :: fun((Queue) -> Queue),
       Ret :: Queue | not_found.
 
-update_in_khepri_tx(Name, Fun) ->
-    Path = khepri_queue_path(Name),
+update_in_khepri_tx(VHost, Pattern, Fun) ->
+    Path = khepri_queue_path(VHost, Pattern),
     case khepri_tx:get(Path) of
         {ok, Q} ->
             Q1 = Fun(Q),
             ok = khepri_tx:put(Path, Q1),
             Q1;
+        {error, ?khepri_error(mismatching_node, _)} ->
+            khepri_tx:abort(mismatching_node);
         _  ->
             not_found
     end.

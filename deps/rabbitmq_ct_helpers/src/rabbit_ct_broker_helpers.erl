@@ -805,7 +805,7 @@ do_start_rabbitmq_node(Config, NodeConfig, I) ->
     end,
     ok = peer:call(PeerPid, file, set_cwd, [SetCwdPath]),
     %% Boot RabbitMQ.
-    try peer:call(PeerPid, rabbit, boot, [], 60_000) of
+    try peer:call(PeerPid, rabbit, boot, [], 120_000) of
         ok ->
             store_peer_pid(Nodename, PeerPid),
             NodeConfig1 = rabbit_ct_helpers:set_config(
@@ -829,27 +829,16 @@ query_node(Config, NodeConfig) ->
     {ok, EnabledPluginsFile} = rpc(Config, Nodename, application, get_env,
       [rabbit, enabled_plugins_file]),
     LogLocations = rpc(Config, Nodename, rabbit, log_locations, []),
-    Vars0 = [{pid_file, PidFile},
-             {data_dir, DataDir},
-             {plugins_dir, PluginsDir},
-             {enabled_plugins_file, EnabledPluginsFile},
-             {log_locations, LogLocations}],
-    Vars = try
-               EnabledFeatureFlagsFile = rpc(Config, Nodename,
-                                             rabbit_feature_flags,
-                                             enabled_feature_flags_list_file,
-                                             []),
-               [{enabled_feature_flags_list_file, EnabledFeatureFlagsFile}
-                | Vars0]
-           catch
-               exit:{undef, [{rabbit_feature_flags, _, _, _} | _]} ->
-                   %% This happens if the queried node is a RabbitMQ
-                   %% 3.7.x node. If this is the case, we can ignore
-                   %% this and leave the `enabled_plugins_file` config
-                   %% variable unset.
-                   ct:log("NO RABBITMQ_FEATURE_FLAGS_FILE"),
-                   Vars0
-           end,
+    EnabledFeatureFlagsFile = rpc(Config, Nodename,
+                                  rabbit_feature_flags,
+                                  enabled_feature_flags_list_file,
+                                  []),
+    Vars = [{pid_file, PidFile},
+            {data_dir, DataDir},
+            {plugins_dir, PluginsDir},
+            {enabled_plugins_file, EnabledPluginsFile},
+            {log_locations, LogLocations},
+            {enabled_feature_flags_list_file, EnabledFeatureFlagsFile}],
     cover_add_node(Nodename),
     rabbit_ct_helpers:set_config(NodeConfig, Vars).
 
@@ -1318,7 +1307,7 @@ rabbitmqctl(Config, Node, Args, Timeout) ->
 
     NodeConfig = get_node_config(Config, Node),
     Nodename = ?config(nodename, NodeConfig),
-    Env0 = [
+    Env = [
       {"RABBITMQ_SCRIPTS_DIR", filename:dirname(Rabbitmqctl)},
       {"RABBITMQ_NODENAME", atom_to_list(Nodename)},
       {"RABBITMQ_PID_FILE", ?config(pid_file, NodeConfig)},
@@ -1326,17 +1315,10 @@ rabbitmqctl(Config, Node, Args, Timeout) ->
       {"RABBITMQ_PLUGINS_DIR", ?config(plugins_dir, NodeConfig)},
       {"RABBITMQ_ENABLED_PLUGINS_FILE",
         ?config(enabled_plugins_file, NodeConfig)},
-      {"RABBITMQ_CTL_UNIQUE_NODE_NAME", "true"}
+      {"RABBITMQ_CTL_UNIQUE_NODE_NAME", "true"},
+      {"RABBITMQ_FEATURE_FLAGS_FILE",
+        ?config(enabled_feature_flags_list_file, NodeConfig)}
     ],
-    Ret = rabbit_ct_helpers:get_config(
-            NodeConfig, enabled_feature_flags_list_file),
-    Env = case Ret of
-              undefined ->
-                  Env0;
-              EnabledFeatureFlagsFile ->
-                  Env0 ++
-                  [{"RABBITMQ_FEATURE_FLAGS_FILE", EnabledFeatureFlagsFile}]
-          end,
     Cmd = [Rabbitmqctl, "-n", Nodename | Args],
     rabbit_ct_helpers:exec(Cmd, [{env, Env}, {timeout, Timeout}]).
 
@@ -1351,24 +1333,17 @@ rabbitmq_queues(Config, Node, Args) ->
     RabbitmqQueues = ?config(rabbitmq_queues_cmd, Config),
     NodeConfig = get_node_config(Config, Node),
     Nodename = ?config(nodename, NodeConfig),
-    Env0 = [
+    Env = [
       {"RABBITMQ_SCRIPTS_DIR", filename:dirname(RabbitmqQueues)},
       {"RABBITMQ_PID_FILE", ?config(pid_file, NodeConfig)},
       {"RABBITMQ_MNESIA_DIR", ?config(data_dir, NodeConfig)},
       {"RABBITMQ_PLUGINS_DIR", ?config(plugins_dir, NodeConfig)},
       {"RABBITMQ_ENABLED_PLUGINS_FILE",
         ?config(enabled_plugins_file, NodeConfig)},
-      {"RABBITMQ_CTL_UNIQUE_NODE_NAME", "true"}
+      {"RABBITMQ_CTL_UNIQUE_NODE_NAME", "true"},
+      {"RABBITMQ_FEATURE_FLAGS_FILE",
+        ?config(enabled_feature_flags_list_file, NodeConfig)}
     ],
-    Ret = rabbit_ct_helpers:get_config(
-            NodeConfig, enabled_feature_flags_list_file),
-    Env = case Ret of
-              undefined ->
-                  Env0;
-              EnabledFeatureFlagsFile ->
-                  Env0 ++
-                  [{"RABBITMQ_FEATURE_FLAGS_FILE", EnabledFeatureFlagsFile}]
-          end,
     Cmd = [RabbitmqQueues, "-n", Nodename | Args],
     rabbit_ct_helpers:exec(Cmd, [{env, Env}]).
 
@@ -1376,24 +1351,17 @@ rabbitmq_streams(Config, Node, Args) ->
     RabbitmqStreams = ?config(rabbitmq_streams_cmd, Config),
     NodeConfig = get_node_config(Config, Node),
     Nodename = ?config(nodename, NodeConfig),
-    Env0 = [
+    Env = [
       {"RABBITMQ_SCRIPTS_DIR", filename:dirname(RabbitmqStreams)},
       {"RABBITMQ_PID_FILE", ?config(pid_file, NodeConfig)},
       {"RABBITMQ_MNESIA_DIR", ?config(data_dir, NodeConfig)},
       {"RABBITMQ_PLUGINS_DIR", ?config(plugins_dir, NodeConfig)},
       {"RABBITMQ_ENABLED_PLUGINS_FILE",
         ?config(enabled_plugins_file, NodeConfig)},
-      {"RABBITMQ_CTL_UNIQUE_NODE_NAME", "true"}
+      {"RABBITMQ_CTL_UNIQUE_NODE_NAME", "true"},
+      {"RABBITMQ_FEATURE_FLAGS_FILE",
+        ?config(enabled_feature_flags_list_file, NodeConfig)}
     ],
-    Ret = rabbit_ct_helpers:get_config(
-            NodeConfig, enabled_feature_flags_list_file),
-    Env = case Ret of
-              undefined ->
-                  Env0;
-              EnabledFeatureFlagsFile ->
-                  Env0 ++
-                  [{"RABBITMQ_FEATURE_FLAGS_FILE", EnabledFeatureFlagsFile}]
-          end,
     Cmd = [RabbitmqStreams, "-n", Nodename | Args],
     rabbit_ct_helpers:exec(Cmd, [{env, Env}]).
 
@@ -1561,10 +1529,10 @@ add_vhost(Config, Node, VHost) ->
     add_vhost(Config, Node, VHost, <<"acting-user">>).
 
 add_vhost(Config, Node, VHost, Username) ->
-    catch rpc(Config, Node, rabbit_vhost, add, [VHost, Username]).
+    rpc_catch(Config, Node, rabbit_vhost, add, [VHost, Username]).
 
 update_vhost_metadata(Config, VHost, Meta) ->
-    catch rpc(Config, 0, rabbit_vhost, update_metadata, [VHost, Meta, <<"acting-user">>]).
+    rpc_catch(Config, 0, rabbit_vhost, update_metadata, [VHost, Meta, <<"acting-user">>]).
 
 enable_vhost_protection_from_deletion(Config, VHost) ->
     MetadataPatch = #{
@@ -1585,7 +1553,7 @@ delete_vhost(Config, Node, VHost) ->
     delete_vhost(Config, Node, VHost, <<"acting-user">>).
 
 delete_vhost(Config, Node, VHost, Username) ->
-    catch rpc(Config, Node, rabbit_vhost, delete, [VHost, Username]).
+    rpc_catch(Config, Node, rabbit_vhost, delete, [VHost, Username]).
 
 -define(FORCE_VHOST_FAILURE_REASON, force_vhost_failure).
 
@@ -1674,7 +1642,7 @@ add_user(Config, Node, Username, Password) ->
     add_user(Config, Node, Username, Password, <<"acting-user">>).
 
 add_user(Config, Node, Username, Password, AuditUsername) ->
-    catch rpc(Config, Node, rabbit_auth_backend_internal, add_user,
+    rpc_catch(Config, Node, rabbit_auth_backend_internal, add_user,
               [rabbit_data_coercion:to_binary(Username),
                rabbit_data_coercion:to_binary(Password),
                AuditUsername]).
@@ -1683,7 +1651,7 @@ set_user_tags(Config, Node, Username, Tags) ->
     set_user_tags(Config, Node, Username, Tags, <<"acting-user">>).
 
 set_user_tags(Config, Node, Username, Tags, AuditUsername) ->
-    catch rpc(Config, Node, rabbit_auth_backend_internal, set_tags,
+    rpc_catch(Config, Node, rabbit_auth_backend_internal, set_tags,
               [Username, Tags, AuditUsername]).
 
 delete_user(Config, Username) ->
@@ -1693,7 +1661,7 @@ delete_user(Config, Node, Username) ->
     delete_user(Config, Node, Username, <<"acting-user">>).
 
 delete_user(Config, Node, Username, AuditUsername) ->
-    catch rpc(Config, Node, rabbit_auth_backend_internal, delete_user,
+    rpc_catch(Config, Node, rabbit_auth_backend_internal, delete_user,
               [Username, AuditUsername]).
 
 change_password(Config, Username, Password) ->
@@ -1908,6 +1876,17 @@ rpc(Config, Nodes, Module, Function, Args, Timeout)
 when is_list(Nodes) ->
     [rpc(Config, Node, Module, Function, Args, Timeout) || Node <- Nodes].
 
+%% Like rpc/5, but catches any exception raised by the RPC and returns it in
+%% the same shape as the classic `catch Expr' would have.
+rpc_catch(Config, Node, Module, Function, Args) ->
+    try
+        rpc(Config, Node, Module, Function, Args)
+    catch
+        throw:Thrown -> Thrown;
+        exit:Reason -> {'EXIT', Reason};
+        error:Reason:Stacktrace -> {'EXIT', {Reason, Stacktrace}}
+    end.
+
 rpc_all(Config, Module, Function, Args) ->
     Nodes = get_node_configs(Config, nodename),
     rpc(Config, Nodes, Module, Function, Args).
@@ -1933,7 +1912,9 @@ start_node(Config, Node) ->
 async_start_node(Config, Node) ->
     Self = self(),
     spawn(fun() ->
-                  Reply = (catch start_node(Config, Node)),
+                  Reply = try start_node(Config, Node)
+                          catch _:E -> {error, E}
+                          end,
                   Self ! {async_start_node, Node, Reply}
           end),
     ok.

@@ -15,8 +15,6 @@
 
 -module(rabbit_stream_reader).
 
--feature(maybe_expr, enable).
-
 -behaviour(gen_statem).
 
 -include("rabbit_stream_utils.hrl").
@@ -85,8 +83,10 @@
          peer_cert_validity]).
 -define(UNKNOWN_FIELD, unknown_field).
 -define(SILENT_CLOSE_DELAY, 3_000).
--define(METADATA_TIMEOUT, 10_000).
 -define(SAC_MOD, rabbit_stream_sac_coordinator).
+%% publisher_id and subscription_id are encoded as a single byte on the wire.
+-define(MAX_PUBLISHERS_PER_CONNECTION, 256).
+-define(MAX_SUBSCRIPTIONS_PER_CONNECTION, 256).
 
 -import(rabbit_stream_utils, [check_write_permitted/2,
                               check_read_permitted/3,
@@ -115,8 +115,11 @@
 -ifdef(TEST).
 -export([ensure_token_expiry_timer/2,
          evaluate_state_after_secret_update/4,
+         handle_frame_post_auth/4,
+         clean_state_after_super_stream_deletion/5,
          clean_subscriptions/4,
-         negotiate_frame_max/2]).
+         negotiate_frame_max/2,
+         publishing_ids_from_messages/2]).
 -endif.
 
 callback_mode() ->
@@ -147,6 +150,7 @@ init([KeepaliveSup,
       #{initial_credits := InitialCredits,
         credits_required_for_unblocking := CreditsRequiredBeforeUnblocking,
         frame_max := FrameMax,
+        initial_frame_max := InitialFrameMax,
         heartbeat := Heartbeat,
         transport := ConnTransport}]) ->
     process_flag(trap_exit, true),
@@ -168,6 +172,11 @@ init([KeepaliveSup,
             DeliverVersion = ?VERSION_1,
             RequestTimeout = application:get_env(rabbitmq_stream,
                                                  request_timeout, 60_000),
+            MaxUncompressedSubEntryBatchSize =
+              application:get_env(rabbitmq_stream,
+                                  max_uncompressed_sub_entry_batch_size,
+                                  ?DEFAULT_MAX_UNCOMPRESSED_SUB_ENTRY_BATCH_SIZE),
+
             Connection =
                 #stream_connection{name =
                                        rabbit_data_coercion:to_binary(ConnStr),
@@ -187,6 +196,8 @@ init([KeepaliveSup,
                                    authentication_state = none,
                                    connection_step = tcp_connected,
                                    frame_max = FrameMax,
+                                   max_uncompressed_sub_entry_batch_size =
+                                       MaxUncompressedSubEntryBatchSize,
                                    resource_alarm = false,
                                    send_file_oct = SendFileOct,
                                    transport = ConnTransport,
@@ -197,11 +208,15 @@ init([KeepaliveSup,
                                    outstanding_requests = #{},
                                    request_timeout = RequestTimeout,
                                    deliver_version = DeliverVersion},
+            %% Until `open` succeeds, an unauthenticated peer must not be
+            %% able to negotiate a large per-connection buffer.
+            PreAuthFrameMax = negotiate_frame_max(InitialFrameMax, FrameMax),
             State =
                 #stream_connection_state{consumers = #{},
                                          blocked = false,
                                          data =
-                                             rabbit_stream_core:init(#{frame_max => FrameMax})},
+                                             rabbit_stream_core:init(#{frame_max =>
+                                                                           PreAuthFrameMax})},
             Transport:setopts(RealSocket, [{active, once}]),
             _ = rabbit_alarm:register(self(), {?MODULE, resource_alarm, []}),
             ConnectionNegotiationStepTimeout =
@@ -545,10 +560,6 @@ transition_to_opened(Transport,
                      Configuration,
                      NewConnection,
                      NewConnectionState) ->
-    % TODO remove registration to rabbit_stream_connections
-    % just meant to be able to close the connection remotely
-    % should be possible once the connections are available in ctl list_connections
-    pg_local:join(rabbit_stream_connections, self()),
     Connection1 =
         rabbit_event:init_stats_timer(NewConnection,
                                       #stream_connection.stats_timer),
@@ -941,7 +952,9 @@ open(info, heartbeat_send,
      #statem_data{transport = Transport,
                   connection = #stream_connection{socket = S} = Connection}) ->
     Frame = rabbit_stream_core:frame(heartbeat),
-    case catch send(Transport, S, Frame) of
+    case try send(Transport, S, Frame)
+         catch _:E -> {error, E}
+         end of
         ok ->
             keep_state_and_data;
         Unexpected ->
@@ -1273,6 +1286,13 @@ close_sent(info, Msg, _StatemData) ->
     ?LOG_WARNING("Ignored unknown message ~tp in state ~ts",
                                   [Msg, ?FUNCTION_NAME]),
     keep_state_and_data;
+close_sent(cast, {queue_event, _, _}, _StatemData) ->
+    %% Ignore confirmations and offset notifications while closing.
+    keep_state_and_data;
+close_sent(cast, Msg, _StatemData) ->
+    ?LOG_WARNING("Ignored unknown cast ~tp in state ~ts",
+                                  [Msg, ?FUNCTION_NAME]),
+    keep_state_and_data;
 close_sent({call, From}, {info, _Items}, _StateData) ->
     %% must be a CLI call, returning no information
     {keep_state_and_data, {reply, From, []}}.
@@ -1382,6 +1402,13 @@ publishing_ids_from_messages(?VERSION_1 = V, <<PublishingId:64,
                                Rest/binary>>) ->
     [PublishingId | publishing_ids_from_messages(V, Rest)];
 publishing_ids_from_messages(?VERSION_2 = V, <<PublishingId:64,
+                               -1:16/signed,
+                               0:1,
+                               MessageSize:31,
+                               _Message:MessageSize/binary,
+                               Rest/binary>>) ->
+    [PublishingId | publishing_ids_from_messages(V, Rest)];
+publishing_ids_from_messages(?VERSION_2 = V, <<PublishingId:64,
                                FilterValueLength:16, _FilterValue:FilterValueLength/binary,
                                0:1,
                                MessageSize:31,
@@ -1417,7 +1444,7 @@ handle_frame_pre_auth(Transport,
                      <<"cluster_name">> => rabbit_nodes:cluster_name(),
                      <<"platform">> => rabbit_misc:platform_and_version(),
                      <<"copyright">> => ?COPYRIGHT_MESSAGE,
-                     <<"information">> => ?INFORMATION_MESSAGE}),
+                     <<"information">> => rabbit:product_license_line()}),
     ServerProperties =
         maps:map(fun(_, V) -> rabbit_data_coercion:to_binary(V) end,
                  ServerProperties0),
@@ -1553,15 +1580,14 @@ handle_frame_pre_auth(_Transport,
                                          name = ConnectionName,
                                          frame_max = ConfiguredFrameMax} =
                           Connection,
-                      #stream_connection_state{blocked = Blocked,
-                                               data = CoreState0} = State,
+                      #stream_connection_state{blocked = Blocked} = State,
                       {tune, FrameMax, Heartbeat}) ->
     ?LOG_DEBUG("Tuning response ~tp ~tp ",
                                 [FrameMax, Heartbeat]),
     %% 0 on either side means "no limit" and must not be clamped to 0.
+    %% The parser stays clamped to the pre-auth ceiling until `open`
+    %% succeeds; only Connection.frame_max is updated here.
     NegotiatedFrameMax = negotiate_frame_max(FrameMax, ConfiguredFrameMax),
-    CoreState = rabbit_stream_core:set_frame_max(NegotiatedFrameMax,
-                                                 CoreState0),
     Parent = self(),
     %% sending a message to the main process so the heartbeat frame is sent from this main process
     %% otherwise heartbeat frames can interleave with chunk delivery
@@ -1591,17 +1617,17 @@ handle_frame_pre_auth(_Transport,
                                   frame_max = NegotiatedFrameMax,
                                   heartbeat = Heartbeat,
                                   heartbeater = Heartbeater},
-     State#stream_connection_state{data = CoreState}};
+     State};
 handle_frame_pre_auth(Transport,
                       #stream_connection{user = User = #user{username = Username},
                                          socket = S,
                                          ranch_ref = RanchRef,
                                          transport = TransportLayer} =
                           Connection,
-                      State,
+                      #stream_connection_state{data = CoreState0} = State,
                       {request, CorrelationId, {open, VirtualHost}}) ->
     ?LOG_DEBUG("Open frame received for ~ts", [VirtualHost]),
-    Connection1 =
+    {Connection1, State1} =
         maybe
             ok ?= check_node_connection_limit(RanchRef),
             ok ?= check_vhost_alive(VirtualHost),
@@ -1609,8 +1635,8 @@ handle_frame_pre_auth(Transport,
             ok ?= check_user_connection_limit(Username),
             ok ?= check_vhost_access(User, VirtualHost, S),
 
-            AdHost = advertised_host(TransportLayer),
-            AdPort = rabbit_data_coercion:to_binary(advertised_port(TransportLayer)),
+            AdHost = rabbit_stream:advertised_host(TransportLayer),
+            AdPort = rabbit_data_coercion:to_binary(rabbit_stream:advertised_port(TransportLayer)),
             ConnProps = #{<<"advertised_host">> => AdHost,
                           <<"advertised_port">> => AdPort},
 
@@ -1625,7 +1651,11 @@ handle_frame_pre_auth(Transport,
             {_, Conn} = ensure_token_expiry_timer(User,
                                                   Connection#stream_connection{connection_step = opened,
                                                                                virtual_host = VirtualHost}),
-            Conn
+            %% Authenticated and authorized: switch the parser from the
+            %% pre-auth ceiling to the value negotiated at `tune`.
+            CoreState = rabbit_stream_core:set_frame_max(Conn#stream_connection.frame_max,
+                                                         CoreState0),
+            {Conn, State#stream_connection_state{data = CoreState}}
         else
             {error, Explanation} ->
                   ?LOG_WARNING("Opening connection failed: ~ts", [Explanation]),
@@ -1634,9 +1664,9 @@ handle_frame_pre_auth(Transport,
                                                  ?RESPONSE_VHOST_ACCESS_FAILURE,
                                                  #{}}}),
                   maybe_send_or_delay_frame(Transport, S, F, silent_close),
-                  Connection#stream_connection{connection_step = silent_close}
+                  {Connection#stream_connection{connection_step = silent_close}, State}
         end,
-    {Connection1, State};
+    {Connection1, State1};
 handle_frame_pre_auth(_Transport, Connection, State, heartbeat) ->
     ?LOG_DEBUG("Received heartbeat frame pre auth"),
     {Connection, State};
@@ -1798,6 +1828,20 @@ handle_frame_post_auth(Transport,
       end,
     {Connection1, State1};
 handle_frame_post_auth(Transport,
+                       #stream_connection{publishers = Publishers0,
+                                          resource_alarm = false} = Connection0,
+                       State,
+                       {request, CorrelationId,
+                        {declare_publisher, _PublisherId, _WriterRef, _Stream}})
+                      when map_size(Publishers0) >= ?MAX_PUBLISHERS_PER_CONNECTION ->
+    response(Transport,
+             Connection0,
+             declare_publisher,
+             CorrelationId,
+             ?RESPONSE_CODE_PRECONDITION_FAILED),
+    increase_protocol_counter(?PRECONDITION_FAILED),
+    {Connection0, State};
+handle_frame_post_auth(Transport,
                        #stream_connection{user = User,
                                           resource_alarm = false} = C,
                        State,
@@ -1929,7 +1973,9 @@ handle_frame_post_auth(Transport,
 handle_frame_post_auth(Transport,
                        #stream_connection{socket = S,
                                           credits = Credits,
-                                          publishers = Publishers} =
+                                          publishers = Publishers,
+                                          max_uncompressed_sub_entry_batch_size =
+                                              MaxUncompressedSubEntryBatchSize} =
                            Connection,
                        State,
                        {publish, Version, PublisherId, MessageCount, Messages}) ->
@@ -1938,15 +1984,37 @@ handle_frame_post_auth(Transport,
             #publisher{reference = Reference,
                        internal_id = InternalId,
                        leader = Leader,
+                       stream = Stream,
                        message_counters = Counters} =
                 Publisher,
                 increase_messages_received(Counters, MessageCount),
-                rabbit_stream_utils:write_messages(Version, Leader,
-                                                   Reference,
-                                                   PublisherId,
-                                                   InternalId,
-                                                   Messages),
-                sub_credits(Credits, MessageCount),
+                RejectedPublishingIds =
+                    rabbit_stream_utils:write_messages(Version, Leader,
+                                                       Reference,
+                                                       PublisherId,
+                                                       InternalId,
+                                                       Messages,
+                                                       MaxUncompressedSubEntryBatchSize,
+                                                       Stream),
+                RejectedCount =
+                    case RejectedPublishingIds of
+                        [] ->
+                            0;
+                        _ ->
+                            Command =
+                                {publish_error,
+                                 PublisherId,
+                                 ?RESPONSE_CODE_PRECONDITION_FAILED,
+                                 RejectedPublishingIds},
+                            Frame = rabbit_stream_core:frame(Command),
+                            send(Transport, S, Frame),
+                            increase_protocol_counter(?PRECONDITION_FAILED),
+                            length(RejectedPublishingIds)
+                    end,
+                %% credits are returned to the connection only when osiris
+                %% confirms a write, so only debit the entries that were
+                %% actually written, not the rejected ones
+                sub_credits(Credits, MessageCount - RejectedCount),
                 {Connection, State};
         _ ->
             PublishingIds = publishing_ids_from_messages(Version, Messages),
@@ -2041,6 +2109,19 @@ handle_frame_post_auth(Transport, #stream_connection{} = Connection, State,
                         {subscribe,
                          _, _, _, _, _}} = Request) ->
     handle_frame_post_auth(Transport, {ok, Connection}, State, Request);
+handle_frame_post_auth(Transport,
+                       {ok, Connection},
+                       #stream_connection_state{consumers = Consumers} = State,
+                       {request, CorrelationId,
+                        {subscribe, _, _, _, _, _}})
+                      when map_size(Consumers) >= ?MAX_SUBSCRIPTIONS_PER_CONNECTION ->
+    response(Transport,
+             Connection,
+             subscribe,
+             CorrelationId,
+             ?RESPONSE_CODE_PRECONDITION_FAILED),
+    increase_protocol_counter(?PRECONDITION_FAILED),
+    {Connection, State};
 handle_frame_post_auth(Transport, {ok, #stream_connection{user = User} = C}, State,
                        {request, CorrelationId,
                         {subscribe, _, S, _, _, #{ <<"name">> := N}}})
@@ -2069,7 +2150,6 @@ handle_frame_post_auth(Transport,
         #resource{name = Stream,
                   kind = queue,
                   virtual_host = VirtualHost},
-    %% FIXME check the max number of subs is not reached already
     case rabbit_stream_utils:check_read_permitted(QueueResource, User,
                                                   #{})
     of
@@ -2441,6 +2521,16 @@ handle_frame_post_auth(Transport,
                              CorrelationId,
                              ?RESPONSE_CODE_STREAM_DOES_NOT_EXIST),
                     increase_protocol_counter(?STREAM_DOES_NOT_EXIST),
+                    {Connection, State};
+                {error, Error} ->
+                    ?LOG_WARNING("Error while trying to delete stream ~tp: ~tp",
+                                 [Stream, Error]),
+                    response(Transport,
+                             Connection,
+                             delete_stream,
+                             CorrelationId,
+                             ?RESPONSE_CODE_INTERNAL_ERROR),
+                    increase_protocol_counter(?INTERNAL_ERROR),
                     {Connection, State}
             end;
         error ->
@@ -2517,28 +2607,7 @@ handle_frame_post_auth(Transport,
                              =:= false
                      end,
                      Nodes0),
-        HostFun = advertised_host_fun(TransportLayer),
-        PortFun = advertised_port_fun(TransportLayer),
-
-        FetchFun = fun() -> {rabbit_stream:HostFun(), rabbit_stream:PortFun()} end,
-        Results = erpc:multicall(Nodes, FetchFun, ?METADATA_TIMEOUT),
-        NodeEndpoints =
-        lists:foldl(
-          fun({Node, {ok, {Host, Port}}}, Acc) when is_binary(Host), is_integer(Port) ->
-                  %% Happy path: Node responded in time with valid data
-                  Acc#{Node => {Host, Port}};
-             ({Node, {ok, {Host, Port}}}, Acc) ->
-                  %% Node responded, but data was malformed
-                  ?LOG_WARNING("Error when retrieving broker '~tp' metadata: ~tp ~tp",
-                               [Node, Host, Port]),
-                  Acc;
-             ({Node, Error}, Acc) ->
-                  %% Node timed out, was unreachable, or threw an exception
-                  ?LOG_WARNING("Error/Timeout when retrieving broker '~tp' metadata: ~tp",
-                               [Node, Error]),
-                  Acc
-          end,
-          #{}, lists:zip(Nodes, Results)),
+        NodeEndpoints = rabbit_stream_utils:node_endpoints(Nodes, TransportLayer),
 
         Metadata =
         lists:foldl(fun(Stream, Acc) ->
@@ -2961,19 +3030,40 @@ handle_frame_post_auth(Transport,
                             %% Pass the authorization-checked partition snapshot directly to avoid
                             %% a TOCTOU race where a queue.bind between the authz check and the
                             %% deletion could allow unauthorized streams to be deleted.
-                            rabbit_stream_manager:delete_super_stream(VirtualHost,
-                                                                      SuperStream,
-                                                                      Partitions,
-                                                                      Username),
-                            response_ok(Transport,
-                                        Connection,
-                                        delete_super_stream,
-                                        CorrelationId),
-                            {Connection1, State1} = clean_state_after_super_stream_deletion(Partitions,
-                                                                                            Connection,
-                                                                                            State,
-                                                                                            Transport, S),
-                            {Connection1, State1};
+                            case rabbit_stream_manager:delete_super_stream(VirtualHost,
+                                                                            SuperStream,
+                                                                            Partitions,
+                                                                            Username) of
+                                ok ->
+                                    response_ok(Transport,
+                                                Connection,
+                                                delete_super_stream,
+                                                CorrelationId),
+                                    {Connection1, State1} =
+                                        clean_state_after_super_stream_deletion(Partitions,
+                                                                                  Connection,
+                                                                                  State,
+                                                                                  Transport, S),
+                                    {Connection1, State1};
+                                {error,
+                                 {Result, DeletedPartitions, _} = Error}
+                                  when Result =:= partitions_not_deleted;
+                                       Result =:= exchange_not_deleted ->
+                                    ?LOG_WARNING(
+                                      "Error while trying to delete super stream ~tp: ~tp",
+                                      [SuperStream, Error]),
+                                    response(Transport,
+                                             Connection,
+                                             delete_super_stream,
+                                             CorrelationId,
+                                             ?RESPONSE_CODE_INTERNAL_ERROR),
+                                    increase_protocol_counter(?INTERNAL_ERROR),
+                                    {Connection1, State1} =
+                                        clean_state_after_super_stream_deletion(
+                                          DeletedPartitions, Connection, State,
+                                          Transport, S),
+                                    {Connection1, State1}
+                            end;
                         error ->
                             response(Transport,
                                      Connection,
@@ -4369,24 +4459,6 @@ retry_sac_call(Call, N) ->
         R ->
             R
     end.
-
-advertised_host(Transport) ->
-    F = advertised_host_fun(Transport),
-    rabbit_stream:F().
-
-advertised_port(Transport) ->
-    F = advertised_port_fun(Transport),
-    rabbit_stream:F().
-
-advertised_host_fun(tcp) ->
-    host;
-advertised_host_fun(ssl) ->
-    tls_host.
-
-advertised_port_fun(tcp) ->
-    port;
-advertised_port_fun(ssl) ->
-    tls_port.
 
 check_node_connection_limit(undefined) ->
     ok;

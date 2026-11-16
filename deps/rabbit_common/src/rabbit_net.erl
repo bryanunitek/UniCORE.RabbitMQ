@@ -18,6 +18,10 @@
     hostname/0, getifaddrs/0, proxy_ssl_info/2,
     dist_info/0]).
 
+-ifdef(TEST).
+-export([fast_close/2]).
+-endif.
+
 %%---------------------------------------------------------------------------
 
 -export_type([socket/0, proxy_socket/0, ip_port/0, hostname/0]).
@@ -61,10 +65,13 @@
 -spec send(socket(), iodata()) -> ok_or_any_error().
 -spec close(socket()) -> ok_or_any_error().
 -spec fast_close(socket()) -> ok_or_any_error().
+-spec fast_close(socket(), timeout()) -> ok_or_any_error().
 -spec sockname(socket()) ->
-          ok_val_or_error({inet:ip_address(), ip_port()}).
+          ok_val_or_error({inet:ip_address(), ip_port()} |
+                          inet:returned_non_ip_address()).
 -spec peername(socket()) ->
-          ok_val_or_error({inet:ip_address(), ip_port()}).
+          ok_val_or_error({inet:ip_address(), ip_port()} |
+                          inet:returned_non_ip_address()).
 -spec peercert(socket()) ->
           'nossl' | ok_val_or_error(rabbit_cert_info:certificate()).
 -spec connection_string(socket(), 'inbound' | 'outbound') ->
@@ -76,7 +83,7 @@
 -spec is_loopback(socket() | inet:ip_address()) -> boolean().
 % -spec unwrap_socket(socket() | ranch_proxy:proxy_socket() | ranch_proxy_ssl:ssl_socket()) -> socket().
 
--dialyzer({nowarn_function, [socket_ends/2, unwrap_socket/1]}).
+-dialyzer({nowarn_function, [unwrap_socket/1]}).
 
 %%---------------------------------------------------------------------------
 
@@ -176,11 +183,77 @@ send(Sock, Data) when is_port(Sock) -> gen_tcp:send(Sock, Data).
 close(Sock)      when ?IS_SSL(Sock) -> ssl:close(Sock);
 close(Sock)      when is_port(Sock) -> gen_tcp:close(Sock).
 
-fast_close(Sock) when ?IS_SSL(Sock) ->
-    _ = ssl:close(Sock, ?SSL_CLOSE_TIMEOUT),
+fast_close(Sock) ->
+    fast_close(Sock, ?SSL_CLOSE_TIMEOUT).
+
+%% `ssl:close/2` calls the TLS connection process with an infinite timeout, so
+%% a connection stuck in `tls_gen_connection:close/4` hangs the caller forever.
+%% Run it in a separate process; if it does not finish within `Timeout`, close
+%% the transport port, which makes the stuck `recv` return.
+fast_close(Sock, Timeout) when ?IS_SSL(Sock) ->
+    {Pid, MRef} = spawn_monitor(
+                    fun () ->
+                            try ssl:close(Sock, Timeout) catch exit:_ -> ok end
+                    end),
+    receive
+        {'DOWN', MRef, process, Pid, _} ->
+            ok
+    after Timeout ->
+        force_close_stuck_ssl_connections(Pid, MRef, Timeout)
+    end;
+fast_close(Sock, _Timeout) when is_port(Sock) ->
+    try port_close(Sock) catch _:_ -> ok end,
+    ok.
+
+force_close_stuck_ssl_connections(Pid, MRef, Timeout) ->
+    ConnPid = get_ssl_connection_pid(Pid),
+    _ = close_linked_ports(ConnPid),
+    receive
+        {'DOWN', MRef, process, Pid, _} ->
+            ok
+    after Timeout ->
+        %% Last resort if closing the port did not unblock `ssl:close/2`.
+        _ = case ConnPid of
+                undefined -> ok;
+                _         -> exit(ConnPid, kill)
+            end,
+        erlang:demonitor(MRef, [flush]),
+        exit(Pid, kill),
+        ok
+    end.
+
+%% The closer process blocks in one `gen_statem:call`, so it monitors exactly
+%% the TLS connection process, which owns the transport port. This avoids
+%% reading the version-specific `#sslsocket{}` record.
+get_ssl_connection_pid(Pid) ->
+    case erlang:process_info(Pid, monitors) of
+        {monitors, Monitors} ->
+            case [ConnPid || {process, ConnPid} <- Monitors,
+                             has_linked_port(ConnPid)] of
+                [ConnPid | _] -> ConnPid;
+                []            -> undefined
+            end;
+        _ ->
+            undefined
+    end.
+
+has_linked_port(Pid) ->
+    case erlang:process_info(Pid, links) of
+        {links, Links} -> lists:any(fun erlang:is_port/1, Links);
+        _              -> false
+    end.
+
+close_linked_ports(undefined) ->
     ok;
-fast_close(Sock) when is_port(Sock) ->
-    catch port_close(Sock), ok.
+close_linked_ports(Pid) ->
+    case erlang:process_info(Pid, links) of
+        {links, Links} ->
+            _ = [try erlang:port_close(P) catch _:_ -> ok end
+                 || P <- Links, is_port(P)],
+            ok;
+        _ ->
+            ok
+    end.
 
 sockname(Sock)   when ?IS_SSL(Sock) -> ssl:sockname(Sock);
 sockname(Sock)   when is_port(Sock) -> inet:sockname(Sock).
@@ -206,6 +279,9 @@ socket_ends(Sock, Direction) when ?IS_SSL(Sock);
                                   is_port(Sock) ->
     {From, To} = sock_funs(Direction),
     case {From(Sock), To(Sock)} of
+        {{ok, {local, FromPath}}, {ok, {local, ToPath}}} ->
+            {ok, {{local, FromPath}, 0,
+                  {local, ToPath},   0}};
         {{ok, {FromAddress, FromPort}}, {ok, {ToAddress, ToPort}}} ->
             {ok, {rdns(FromAddress), FromPort,
                 rdns(ToAddress),   ToPort}};
@@ -286,14 +362,16 @@ sock_funs(outbound) -> {fun sockname/1, fun peername/1}.
 
 is_loopback(Sock) when is_port(Sock) ; ?IS_SSL(Sock) ->
     case peername(Sock) of
-        {ok, {Addr, _Port}} -> is_loopback(Addr);
-        {error, _}          -> false
+        {ok, {local, _} = Addr} -> is_loopback(Addr);
+        {ok, {Addr, _Port}}     -> is_loopback(Addr);
+        {error, _}              -> false
     end;
 %% We could parse the results of inet:getifaddrs() instead. But that
 %% would be more complex and less maybe Windows-compatible...
 is_loopback({127,_,_,_})             -> true;
 is_loopback({0,0,0,0,0,0,0,1})       -> true;
 is_loopback({0,0,0,0,0,65535,AB,CD}) -> is_loopback(ipv4(AB, CD));
+is_loopback({local, _})              -> true;
 is_loopback(_)                       -> false.
 
 ipv4(AB, CD) -> {AB bsr 8, AB band 255, CD bsr 8, CD band 255}.

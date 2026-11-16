@@ -18,7 +18,8 @@
                             await_amqp10_event/3, amqp10_expect_one/2,
                             amqp10_expect_count/3, amqp10_publish/4,
                             amqp10_publish_expect/5, amqp10_declare_queue/3,
-                            await_autodelete/2]).
+                            await_autodelete/2,
+                            with_duration_floor/3]).
 
 -define(PARAM, <<"test">>).
 
@@ -35,7 +36,14 @@ groups() ->
           change_definition,
           simple_amqp10_dest,
           amqp091_to_amqp10_with_dead_lettering,
-          test_amqp10_delete_after_queue_length
+          dest_rejects,
+          dest_releases,
+          test_amqp10_delete_after_queue_length,
+          delete_after_duration_validation,
+          delete_after_duration_autodeletes,
+          delete_after_duration_runs,
+          delete_after_duration_runs_long,
+          delete_after_duration_expired_handled
         ]},
       {with_map_config, [], [
           simple,
@@ -130,6 +138,44 @@ amqp091_to_amqp10_with_dead_lettering(Config) ->
               test_amqp10_destination(Config, Src, Dest, Sess, <<"amqp091">>, <<"src-queue">>),
               %% publish to tmp, it should be dead-lettered to src and then shovelled to dest
               _ = amqp10_publish_expect(Sess, TmpAddress, DstAddress, <<"hello">>, 1)
+      end).
+
+dest_rejects(Config) ->
+    Dest = ?config(destq, Config),
+    DeclareDest = fun(Sess) ->
+                          amqp10_declare_queue(
+                            Sess, Dest, #{<<"x-max-length">> => {ulong, 0},
+                                          <<"x-overflow">> => {utf8, <<"reject-publish">>}})
+                  end,
+    dest_does_not_accept(Config, DeclareDest, rabbitmq_amqp_address:queue(Dest)).
+
+dest_releases(Config) ->
+    DeclareDest = fun(_Sess) -> ok end,
+    DestAddress = rabbitmq_amqp_address:exchange(<<"amq.direct">>, <<"unroutable">>),
+    dest_does_not_accept(Config, DeclareDest, DestAddress).
+
+dest_does_not_accept(Config, DeclareDest, DestAddress) ->
+    Src = ?config(srcq, Config),
+    DLQ = <<Src/binary, "_dlq">>,
+    SrcAddress = rabbitmq_amqp_address:queue(Src),
+    with_amqp10_session(Config,
+      fun (Sess) ->
+              amqp10_declare_queue(Sess, DLQ, #{}),
+              amqp10_declare_queue(Sess, Src, #{<<"x-queue-type">> => {utf8, <<"quorum">>},
+                                                <<"x-delivery-limit">> => {ulong, 0},
+                                                <<"x-dead-letter-exchange">> => {utf8, <<>>},
+                                                <<"x-dead-letter-routing-key">> => {utf8, DLQ}}),
+              DeclareDest(Sess),
+              shovel_test_utils:set_param(Config, ?PARAM,
+                                          [{<<"src-protocol">>, <<"amqp10">>},
+                                           {<<"src-address">>, SrcAddress},
+                                           {<<"dest-protocol">>, <<"amqp10">>},
+                                           {<<"dest-address">>, DestAddress}]),
+              amqp10_publish(Sess, SrcAddress, <<"m">>, 3),
+              Msgs = amqp10_expect_count(Sess, rabbitmq_amqp_address:queue(DLQ), 3),
+              ?assertEqual([<<"m1">>, <<"m2">>, <<"m3">>],
+                           [amqp10_msg:body_bin(M) || M <- lists:reverse(Msgs)]),
+              amqp10_expect_empty(Sess, SrcAddress)
       end).
 
 test_amqp10_destination(Config, Src, Dest, Sess, Protocol, ProtocolSrc) ->
@@ -236,7 +282,96 @@ test_amqp10_delete_after_queue_length(Config) ->
     {_, Msg} = Error,
     ?assertMatch(match, re:run(Msg, "Validation failed.*", [{capture, none}])).
 
+delete_after_duration_validation(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    Uri = shovel_test_utils:make_uri(Config, 0),
+    Set = fun(Duration) ->
+                  rabbit_ct_broker_helpers:rpc(
+                    Config, 0,
+                    rabbit_runtime_parameters, set,
+                    [<<"/">>, <<"shovel">>, ?PARAM,
+                     [{<<"src-uri">>,  Uri},
+                      {<<"dest-uri">>, [Uri]},
+                      {<<"src-protocol">>, <<"amqp10">>},
+                      {<<"src-address">>, Src},
+                      {<<"dest-protocol">>, <<"amqp10">>},
+                      {<<"dest-address">>, Dest},
+                      {<<"src-delete-after-duration">>, Duration}],
+                     none])
+          end,
+    ?assertMatch({error_string, _}, Set(0)),
+    ?assertMatch({error_string, _}, Set(<<"whenever">>)),
+    ?assertMatch({error_string, _}, Set(100 * 365 * 24 * 60 * 60)),
+    ok.
+
+delete_after_duration_autodeletes(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    %% duration to be coerced to the floor
+    Duration = 1,
+    Floor = 15,
+    with_amqp10_session(Config,
+      fun (Sess) ->
+              amqp10_declare_queue(Sess, Src, #{}),
+              amqp10_declare_queue(Sess, Dest, #{})
+      end),
+    with_duration_floor(Config, Floor, fun() ->
+        Before = erlang:monotonic_time(millisecond),
+        set_duration_shovel(Config, Src, Dest, Duration),
+        await_autodelete(Config, ?PARAM),
+        Elapsed = erlang:monotonic_time(millisecond) - Before,
+        ?assert(Elapsed >= Floor * 1000)
+    end),
+    ok.
+
+delete_after_duration_runs(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    with_amqp10_session(Config,
+      fun (Sess) ->
+              amqp10_declare_queue(Sess, Src, #{}),
+              amqp10_declare_queue(Sess, Dest, #{}),
+              set_duration_shovel(Config, Src, Dest, 300),
+              _ = amqp10_publish_expect(Sess, rabbitmq_amqp_address:queue(Src),
+                                        rabbitmq_amqp_address:queue(Dest),
+                                        <<"hello">>, 1),
+              %% 'flow' is a normal live sub-state of a running AMQP 1.0 shovel
+              ?assert(lists:member(
+                        shovel_test_utils:get_shovel_status(Config, ?PARAM),
+                        [running, flow]))
+      end).
+
+delete_after_duration_runs_long(Config) ->
+    Src = ?config(srcq, Config),
+    Dest = ?config(destq, Config),
+    MaxSeconds = 10 * 365 * 24 * 60 * 60,
+    with_amqp10_session(Config,
+      fun (Sess) ->
+              amqp10_declare_queue(Sess, Src, #{}),
+              amqp10_declare_queue(Sess, Dest, #{})
+      end),
+    set_duration_shovel(Config, Src, Dest, MaxSeconds),
+    ?assert(lists:member(shovel_test_utils:get_shovel_status(Config, ?PARAM),
+                         [running, flow])).
+
+delete_after_duration_expired_handled(_Config) ->
+    ?assertEqual({stop, {shutdown, autodelete}},
+                 rabbit_amqp10_shovel:handle_source(
+                   {internal, delete_after_duration_expired}, #{})),
+    ok.
+
 %%----------------------------------------------------------------------------
+set_duration_shovel(Config, Src, Dest, Duration) ->
+    shovel_test_utils:set_param(
+      Config, ?PARAM,
+      [{<<"src-protocol">>, <<"amqp10">>},
+       {<<"src-address">>, rabbitmq_amqp_address:queue(Src)},
+       {<<"dest-protocol">>, <<"amqp10">>},
+       {<<"dest-address">>, rabbitmq_amqp_address:queue(Dest)},
+       {<<"src-delete-after">>, <<"never">>},
+       {<<"src-delete-after-duration">>, Duration}]).
+
 publish(Sender, Msg) ->
     ok = amqp10_client:send_msg(Sender, Msg),
     Tag = amqp10_msg:delivery_tag(Msg),

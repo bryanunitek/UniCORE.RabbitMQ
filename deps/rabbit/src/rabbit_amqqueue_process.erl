@@ -25,7 +25,6 @@
 -export([init/1, terminate/2, code_change/3, handle_call/3, handle_cast/2,
          handle_info/2, handle_pre_hibernate/1, prioritise_call/4,
          prioritise_cast/3, prioritise_info/3, format_state/1, format_message_queue/2]).
--export([format/1]).
 -export([is_policy_applicable/2]).
 
 %% Queue's state
@@ -54,6 +53,8 @@
             rate_timer_ref,
             %% timer used to clean up this queue due to TTL (on when unused)
             expiry_timer_ref,
+            %% system time in milliseconds when the expiry timer was last armed
+            idle_since,
             %% stats emission timer
             stats_timer,
             %% maps message IDs to {channel pid, MsgSeqNo}
@@ -222,17 +223,18 @@ init_it2(Recover, From, State = #q{q                   = Q,
                 true ->
                     BQ = backing_queue_module(),
                     BQS = bq_init(BQ, Q, TermsOrNew),
-                    send_reply(From, {new, Q}),
+                    _ = send_reply(From, {new, Q}),
                     recovery_barrier(Barrier),
                     State1 = process_args_policy(
                                State#q{backing_queue       = BQ,
                                        backing_queue_state = BQS}),
+                    State2 = recover_expiry_timer(TermsOrNew, State1),
                     notify_decorators(startup, State),
                     rabbit_event:notify(queue_created,
                                         queue_created_infos(State1)),
                     rabbit_event:if_enabled(State1, #q.stats_timer,
                                             fun() -> emit_stats(State1) end),
-                    noreply(State1);
+                    noreply(State2);
                 false ->
                     stop_for_init(From, {stop, normal, {existing, Q1}, State})
             end;
@@ -245,6 +247,37 @@ init_it2(Recover, From, State = #q{q                   = Q,
         Err ->
             stop_for_init(From, {stop, normal, Err, State})
     end.
+
+recover_expiry_timer(Terms, State = #q{expires = Expires,
+                                       args_policy_version = Version})
+  when is_list(Terms) andalso is_integer(Expires) ->
+    case idle_since(Terms) of
+        undefined ->
+            State;
+        IdleSince ->
+            Elapsed = max(0, os:system_time(millisecond) - IdleSince),
+            State1 = stop_expiry_timer(State#q{idle_since = IdleSince}),
+            rabbit_misc:ensure_timer(State1, #q.expiry_timer_ref,
+                                     max(0, Expires - Elapsed),
+                                     {maybe_expire, Version})
+    end;
+recover_expiry_timer(_, State) ->
+    State.
+
+%% `rabbit_priority_queue` wraps the terms in a list with one element per priority.
+idle_since([Terms | _]) when is_list(Terms) ->
+    proplists:get_value(idle_since, Terms);
+idle_since(Terms) ->
+    proplists:get_value(idle_since, Terms).
+
+idle_since_on_shutdown(State = #q{idle_since = IdleSince})
+  when is_integer(IdleSince) ->
+    case is_unused(State) of
+        true  -> IdleSince;
+        false -> os:system_time(millisecond)
+    end;
+idle_since_on_shutdown(_State) ->
+    os:system_time(millisecond).
 
 recovery_status(new)              -> {no_barrier, new};
 recovery_status({Recover, Terms}) -> {Recover,    Terms}.
@@ -303,12 +336,12 @@ terminate(shutdown = R, State = #q{backing_queue = BQ, q = Q0}) ->
     terminate_shutdown(
     fun (BQS) ->
         _ = update_state(stopped, Q0),
-        BQ:terminate(R, BQS)
+        BQ:terminate({R, #{idle_since => idle_since_on_shutdown(State)}}, BQS)
     end, State);
 terminate({shutdown, missing_owner = Reason}, {{reply_to, From}, #q{q = Q} = State}) ->
     %% if the owner was missing then there will be no queue, so don't emit stats
     State1 = terminate_shutdown(terminate_delete(false, Reason, none, State), State),
-    send_reply(From, {owner_died, Q}),
+    _ = send_reply(From, {owner_died, Q}),
     State1;
 terminate({shutdown, _} = R, State = #q{backing_queue = BQ}) ->
     rabbit_core_metrics:queue_deleted(qname(State)),
@@ -351,7 +384,7 @@ terminate_delete(EmitStats, Reason0, ReplyTo,
                                                 fun() -> emit_stats(State) end);
            true      -> ok
         end,
-        case ReplyTo of
+        _ = case ReplyTo of
             _ when ReplyTo =/= none ->
                 Reply = case delete_queue_record(Q, ActingUser, Reason0) of
                             ok ->
@@ -504,7 +537,8 @@ res_min(PolVal, ArgVal)  -> erlang:min(PolVal, ArgVal).
 %% In both these we init with the undefined variant first to stop any
 %% existing timer, then start a new one which may fire after a
 %% different time.
-init_exp(undefined, State) -> stop_expiry_timer(State#q{expires = undefined});
+init_exp(undefined, State) -> stop_expiry_timer(State#q{expires    = undefined,
+                                                       idle_since = undefined});
 init_exp(Expires,   State) -> State1 = init_exp(undefined, State),
                               ensure_expiry_timer(State1#q{expires = Expires}).
 
@@ -591,8 +625,9 @@ ensure_expiry_timer(State = #q{expires             = Expires,
                                args_policy_version = Version}) ->
     case is_unused(State) of
         true  -> NewState = stop_expiry_timer(State),
-                 rabbit_misc:ensure_timer(NewState, #q.expiry_timer_ref,
-                                          Expires, {maybe_expire, Version});
+                 rabbit_misc:ensure_timer(
+                   NewState#q{idle_since = os:system_time(millisecond)},
+                   #q.expiry_timer_ref, Expires, {maybe_expire, Version});
         false -> State
     end.
 
@@ -1143,7 +1178,7 @@ infos(Items, #q{q = Q} = State) ->
                          {messages, i(messages, State)},
                          {messages_unacknowledged, i(messages_unacknowledged, State)}] ++ Acc;
                    (type_specific, Acc) ->
-                        format(Q) ++ Acc;
+                        [{node, node(amqqueue:get_pid(Q))}] ++ Acc;
                    (Item, Acc) ->
                         [{Item, i(Item, State)} | Acc]
                 end, [], Items).
@@ -1791,10 +1826,6 @@ format_state(#q{}=S) ->
     maybe_format_backing_queue_state(S).
 
 format_message_queue(Opt, MQ) -> rabbit_misc:format_message_queue(Opt, MQ).
-
-%% TODO: this can be removed after 3.13
-format(Q) when ?is_amqqueue(Q) ->
-    [{node, node(amqqueue:get_pid(Q))}].
 
 -spec is_policy_applicable(amqqueue:amqqueue(), any()) -> boolean().
 is_policy_applicable(_Q, _Policy) ->

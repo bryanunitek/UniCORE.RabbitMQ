@@ -6,7 +6,6 @@
 %%
 
 -module(rabbit_queue_type).
--feature(maybe_expr, enable).
 
 -behaviour(rabbit_registry_class).
 
@@ -53,6 +52,7 @@
          deliver/4,
          settle/5,
          credit/6,
+         assign_deferred/4,
          dequeue/5,
          fold_state/3,
          is_policy_applicable/2,
@@ -108,6 +108,7 @@
     %% fully to the queue
     {settled, queue_name(), [correlation()]} |
     {rejected, queue_name(), reject_reason(), [correlation()]} |
+    {queue_deleted, queue_name()} |
     {deliver, rabbit_types:ctag(), boolean(), [rabbit_amqqueue:qmsg()]} |
     {block | unblock, QueueName :: term()} |
     credit_reply_action().
@@ -148,6 +149,7 @@
                          user := rabbit_types:username()}.
 
 -type delivery_options() :: #{correlation => correlation(),
+                              report_deleted_queues => boolean(),
                               atom() => term()}.
 
 -type settle_op() :: complete |
@@ -249,6 +251,17 @@
                  Drain :: boolean(), queue_state()) ->
     {queue_state(), actions()}.
 
+-optional_callbacks([assign_deferred/4]).
+
+%% Claim, for a consumer, the messages that were deferred (via
+%% x-opt-deferral-token) under the given tokens. Only supported by quorum
+%% queues. The call is fire-and-forget and says nothing about link credit:
+%% claimed messages arrive as normal deliveries, ahead of the ready backlog,
+%% as the consumer's credit allows.
+-callback assign_deferred(queue_name(), rabbit_types:ctag(), Tokens :: [binary()],
+                          queue_state()) ->
+    {queue_state(), actions()}.
+
 -callback dequeue(amqqueue:amqqueue(), NoAck :: boolean(), LimiterPid :: pid(),
                   rabbit_types:ctag(),
                   Timeout :: non_neg_integer() | infinity | undefined,
@@ -318,8 +331,14 @@ discover(<<>>) ->
 discover(undefined) ->
     fallback();
 discover(TypeDescriptor) ->
-    {ok, TypeModule} = rabbit_registry:lookup_type_module(queue, TypeDescriptor),
-    TypeModule.
+    case rabbit_registry:lookup_type_module(queue, TypeDescriptor) of
+        {ok, TypeModule} ->
+            TypeModule;
+        {error, not_found} ->
+            rabbit_misc:protocol_error(
+              precondition_failed, "unknown queue type '~ts'",
+              [rabbit_data_coercion:to_binary(TypeDescriptor)])
+    end.
 
 -spec short_alias_of(TypeDescriptor) -> Ret when
       TypeDescriptor :: {utf8, binary()} | atom() | binary(),
@@ -667,9 +686,34 @@ deliver(Qs, Message, Options, State) ->
     try
         deliver0(Qs, Message, Options, State)
     catch
+        %% A queue was deleted before it could be delivered to.
+        %% See rabbitmq/rabbitmq-server#17645 for one such example.
+        %%
+        %% Only `get_ctx_with/3' raises this, before `deliver0/4' calls any
+        %% queue type's `deliver/3', so the retry cannot duplicate a delivery.
+        exit:{target_queue_not_found, QName} ->
+            case deliver(without_queue(QName, Qs), Message, Options, State) of
+                {ok, State1, Actions} ->
+                    {ok, State1, deleted_queue_actions(QName, Options) ++ Actions};
+                Err ->
+                    Err
+            end;
         exit:Reason ->
             {error, Reason}
     end.
+
+without_queue(QName, Qs) ->
+    lists:filter(fun(Elem) ->
+                         {Q, _BKeys} = queue_binding_keys(Elem),
+                         amqqueue:get_name(Q) =/= QName
+                 end, Qs).
+
+deleted_queue_actions(QName, #{report_deleted_queues := true}) ->
+    [{queue_deleted, QName}];
+deleted_queue_actions(QName, #{correlation := Corr}) ->
+    [{settled, QName, [Corr]}];
+deleted_queue_actions(_QName, _Options) ->
+    [].
 
 deliver0(Qs, Message0, Options, stateless) ->
     ByTypeAndBindingKeys =
@@ -765,6 +809,22 @@ credit(QName, CTag, DeliveryCount, Credit, Drain, Ctxs) ->
                                   Drain, State0),
     {ok, set_ctx(QName, Ctx#ctx{state = State}, Ctxs), Actions}.
 
+-spec assign_deferred(queue_name(), rabbit_types:ctag(), [binary()], state()) ->
+    {ok, state(), actions()}.
+assign_deferred(QName, CTag, Tokens, Ctxs) ->
+    case get_ctx(QName, Ctxs, undefined) of
+        undefined ->
+            {ok, Ctxs, []};
+        #ctx{state = State0, module = Mod} = Ctx ->
+            case erlang:function_exported(Mod, assign_deferred, 4) of
+                true ->
+                    {State, Actions} = Mod:assign_deferred(QName, CTag, Tokens, State0),
+                    {ok, set_ctx(QName, Ctx#ctx{state = State}, Ctxs), Actions};
+                false ->
+                    {ok, Ctxs, []}
+            end
+    end.
+
 -spec dequeue(amqqueue:amqqueue(), boolean(),
               pid(), rabbit_types:ctag(), state()) ->
     {ok, non_neg_integer(), term(), state()}  |
@@ -819,6 +879,8 @@ get_ctx_with(Q, #?STATE{ctxs = Contexts}, InitState) ->
                 #ctx{module = Mod,
                      state = QState}
             else
+                {error, not_found} ->
+                    exit({target_queue_not_found, Ref});
                 {error, Reason} ->
                     exit({Reason, Ref})
             end;
@@ -1044,7 +1106,7 @@ queue_vm_ets() ->
                 end,
                 {[], []}, rabbit_registry:lookup_all(queue)).
 
-table_lookup(Tbl, Key, Default) 
+table_lookup(Tbl, Key, Default)
   when is_list(Tbl) andalso
        is_binary(Key) ->
     case rabbit_misc:table_lookup(Tbl, Key) of

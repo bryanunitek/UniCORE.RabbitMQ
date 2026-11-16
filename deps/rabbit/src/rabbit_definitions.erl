@@ -986,8 +986,20 @@ add_binding_int(Binding, Source, Destination, ActingUser) ->
             throw(Err)
     end.
 
+%% destination_type is a binary from JSON, or an atom from all_definitions/0 (CLI erlang export/import).
 dest_type(Binding) ->
-    rabbit_data_coercion:to_atom(maps:get(destination_type, Binding, undefined)).
+    case maps:get(destination_type, Binding, undefined) of
+        <<"queue">>    -> queue;
+        <<"exchange">> -> exchange;
+        queue          -> queue;
+        exchange       -> exchange;
+        Other          -> throw({error, invalid_destination_type_message(Other)})
+    end.
+
+-spec invalid_destination_type_message(any()) -> binary().
+invalid_destination_type_message(Other) ->
+    rabbit_data_coercion:to_utf8_binary(
+      rabbit_misc:format("~tp is not a valid binding destination_type", [Other])).
 
 r(Type, Props) -> r(Type, name, Props).
 
@@ -1222,7 +1234,7 @@ is_internal_parameter(Param) ->
     Name = rabbit_data_coercion:to_list(pget(name, Param)),
     %% if global parameter name starts with an "internal", consider it to be internal
     %% and exclude it from definition export
-    string:left(Name, length(?INTERNAL_GLOBAL_PARAM_PREFIX)) =:= ?INTERNAL_GLOBAL_PARAM_PREFIX.
+    string:prefix(Name, ?INTERNAL_GLOBAL_PARAM_PREFIX) =/= nomatch.
 
 list_policies() ->
     [policy_definition(P) || P <- rabbit_policy:list()].

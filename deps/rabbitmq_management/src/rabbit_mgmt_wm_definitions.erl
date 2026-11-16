@@ -10,7 +10,7 @@
 -export([init/2, to_json/2, content_types_provided/2, is_authorized/2]).
 -export([content_types_accepted/2, allowed_methods/2, accept_json/2]).
 -export([accept_multipart/2]).
--export([variances/2]).
+-export([variances/2, generate_etag/2]).
 -export([has_json_extension/1]).
 
 -include("rabbit_mgmt.hrl").
@@ -28,6 +28,32 @@ variances(Req, Context) ->
 
 content_types_provided(ReqData, Context) ->
    {rabbit_mgmt_util:responder_map(to_json), ReqData, Context}.
+
+%% Conditional request support: derive a cheap ETag from the metadata store
+%% version (plus the product version, the requested scope and the negotiated
+%% media type) so that an up-to-date client gets a 304 and we never build the
+%% definitions body. Returns 'undefined' (disabling conditional handling) when
+%% the store version cannot be obtained cheaply, e.g. when Khepri is not the
+%% active metadata store.
+generate_etag(ReqData, Context) ->
+    case rabbit_khepri:metadata_store_version() of
+        {ok, {Term, LastApplied}} ->
+            Scope = case rabbit_mgmt_util:vhost(ReqData) of
+                        none      -> cluster;
+                        not_found -> {not_found, rabbit_mgmt_util:id(vhost, ReqData)};
+                        VHost     -> VHost
+                    end,
+            MediaType = maps:get(media_type, ReqData, undefined),
+            Vsn = rabbit:base_product_version(),
+            StaticTag = erlang:phash2({Vsn, Scope, MediaType}),
+            Tag = <<(integer_to_binary(Term, 16))/binary, $-,
+                    (integer_to_binary(LastApplied, 16))/binary, $-,
+                    (integer_to_binary(StaticTag, 16))/binary>>,
+            ReqData1 = cowboy_req:set_resp_header(<<"cache-control">>, <<"no-cache">>, ReqData),
+            {{strong, Tag}, ReqData1, Context};
+        unavailable ->
+            {undefined, ReqData, Context}
+    end.
 
 content_types_accepted(ReqData, Context) ->
    {[{{<<"application">>, <<"json">>, '*'}, accept_json},
@@ -276,14 +302,8 @@ accept_multipart(ReqData0, Context) ->
                                                  ExtraFields,
                                                  ReqData, Context);
                 true ->
-                    Redirect = get_part(<<"redirect">>, Parts),
                     Payload = get_part(<<"file">>, Parts),
-                    Resp = {Res, _, _} = accept(Payload, ReqData, Context),
-                    case {Res, Redirect} of
-                        {true, unknown} -> {true, ReqData, Context};
-                        {true, _}       -> {{true, Redirect}, ReqData, Context};
-                        _               -> Resp
-                    end
+                    accept(Payload, ReqData, Context)
             end
     end.
 
@@ -395,7 +415,8 @@ get_all_parts(Req0, BodySize0, BodySizeLimit, Acc, FileFilename) ->
     end.
 
 is_acceptable_filename(Filename) ->
-    not rabbit_mgmt_features:is_definition_json_extension_required()
+    Settings = rabbit_mgmt_features:get_definitions_settings(),
+    not proplists:get_value(require_definition_json_extension, Settings, false)
         orelse has_json_extension(Filename).
 
 has_json_extension(unknown) ->

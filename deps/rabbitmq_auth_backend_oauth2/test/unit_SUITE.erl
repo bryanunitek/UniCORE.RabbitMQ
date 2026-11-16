@@ -73,7 +73,6 @@ groups() ->
           test_successful_access_with_a_token_that_uses_multiple_scope_aliases_in_scope_field,
           test_successful_authorization_without_scopes,
           test_successful_authentication_without_scopes,
-          test_ignore_non_existing_tag_atoms,
           test_successful_access_with_a_token_that_uses_single_scope_alias_with_var_expansion,
           test_successful_access_with_a_token_that_uses_single_scope_alias_in_extra_scope_source_field,
           test_successful_access_with_a_token_that_uses_multiple_scope_aliases_in_extra_scope_source_field,
@@ -366,7 +365,7 @@ normalize_token_scope_with_rich_auth_request(_) ->
         ],
         [<<"read:*/*/*">> ]
     },
-    { "should filter out those permisions whose locations' regexpr do not match the cluster : {resource_server_id} ",
+    { "should filter out those permisions whose locations' regex do not match the cluster : {resource_server_id} ",
         [ #{<<"type">> => ?RESOURCE_SERVER_TYPE,
             <<"locations">> => [<<"cluster:rabbit*">>],
             <<"actions">> => [<<"read">>]
@@ -702,18 +701,6 @@ test_successful_authentication_without_scopes(_) ->
     {ok, #auth_user{username = Username} } =
       user_login_authentication(Username, [{password, Token}]).
 
-test_ignore_non_existing_tag_atoms(_) ->
-    Jwk = ?UTIL_MOD:fixture_jwk(),
-    UaaEnv = [{signing_keys, #{<<"token-key">> => {map, Jwk}}}],
-    application:set_env(rabbitmq_auth_backend_oauth2, key_config, UaaEnv),
-
-    Username = <<"username">>,
-    Token    = ?UTIL_MOD:sign_token_hs(?UTIL_MOD:token_with_sub(
-        ?UTIL_MOD:fixture_token([<<"rabbitmq.tag:i_do_not_exist_as_an_atom_123">>]), Username), Jwk),
-
-    {ok, #auth_user{username = Username, tags = []} } =
-      user_login_authentication(Username, [{password, Token}]).
-
 test_successful_authorization_without_scopes(_) ->
     Jwk = ?UTIL_MOD:fixture_jwk(),
     UaaEnv = [{signing_keys, #{<<"token-key">> => {map, Jwk}}}],
@@ -795,7 +782,7 @@ test_successful_access_with_a_token_that_has_tag_scopes(_) ->
             [<<"rabbitmq.tag:management">>, <<"rabbitmq.tag:policymaker">>]),
                 Username), Jwk),
 
-    {ok, #auth_user{username = Username, tags = [management, policymaker]}} =
+    {ok, #auth_user{username = Username, tags = [<<"management">>, <<"policymaker">>]}} =
         user_login_authentication(Username, [{password, Token}]).
 
 test_successful_access_with_a_token_that_uses_single_scope_alias_with_var_expansion(_) ->
@@ -1592,7 +1579,7 @@ test_token_with_too_many_scopes(_) ->
 
 test_extract_scope_from_path_expression(_) ->
     M = fun rabbit_auth_backend_oauth2:extract_scope_list_from_token_value/2,
-    R = #resource_server{id = <<"rabbitmq">>},
+    R = #resource_server{id = <<"rabbitmq">>, scope_pattern_syntax = wildcard},
 
     [<<"role1">>] = extract_token_value(R,
         #{ <<"auth">> => #{ <<"permission">> => <<"role1">> }}, 

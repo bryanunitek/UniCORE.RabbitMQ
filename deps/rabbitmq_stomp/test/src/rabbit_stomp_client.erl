@@ -9,7 +9,7 @@
 
 -module(rabbit_stomp_client).
 
--export([connect/1, connect/2, connect/4, connect/5, disconnect/1, send/2, send/3, send/4, recv/1]).
+-export([connect/1, connect/2, connect/4, connect/5, disconnect/1, send/2, send/3, send/4, recv/1, recv/2]).
 
 -include("rabbit_stomp_frame.hrl").
 
@@ -27,13 +27,15 @@ connect0(Version, Login, Pass, Port, Headers) ->
     %% AMQP default port.
     {ok, Sock} = gen_tcp:connect(localhost, Port, [{active, false}, binary]),
     Client0 = recv_state(Sock),
-    send(Client0, "CONNECT", [{"login", Login},
-                              {"passcode", Pass} | Version] ++ Headers),
-    {#stomp_frame{command = "CONNECTED"}, Client1} = recv(Client0),
+    send(Client0, 'CONNECT', [{<<"login">>, list_to_binary(Login)},
+                              {<<"passcode">>, list_to_binary(Pass)}
+                              | [{list_to_binary(K), list_to_binary(V)} || {K, V} <- Version]]
+                              ++ Headers),
+    {#stomp_frame{command = 'CONNECTED'}, Client1} = recv(Client0),
     {ok, Client1}.
 
 disconnect(Client = {Sock, _}) ->
-    send(Client, "DISCONNECT"),
+    send(Client, 'DISCONNECT'),
     gen_tcp:close(Sock).
 
 send(Client, Command) ->
@@ -44,32 +46,35 @@ send(Client, Command, Headers) ->
 
 send({Sock, _}, Command, Headers, Body) ->
     Frame = rabbit_stomp_frame:serialize(
-              #stomp_frame{command     = list_to_binary(Command),
-                           headers     = Headers,
-                           body_iolist = Body}),
+              #stomp_frame{command     = Command,
+                           headers     = maps:from_list(Headers),
+                           body_iolist_rev = Body}),
     gen_tcp:send(Sock, Frame).
 
 recv_state(Sock) ->
     {Sock, []}.
 
-recv({_Sock, []} = Client) ->
-    recv(Client, rabbit_stomp_frame:initial_state(), 0);
-recv({Sock, [Frame | Frames]}) ->
+recv(Client) ->
+    recv(Client, ?TIMEOUT).
+
+recv({_Sock, []} = Client, Timeout) ->
+    recv(Client, rabbit_stomp_frame:initial_state(), 0, Timeout);
+recv({Sock, [Frame | Frames]}, _Timeout) ->
     {Frame, {Sock, Frames}}.
 
-recv(Client = {Sock, _}, FrameState, Length) ->
-    {ok, Payload} = gen_tcp:recv(Sock, Length, ?TIMEOUT),
-    parse(Payload, Client, FrameState, Length).
+recv(Client = {Sock, _}, FrameState, Length, Timeout) ->
+    {ok, Payload} = gen_tcp:recv(Sock, Length, Timeout),
+    parse(Payload, Client, FrameState, Length, Timeout).
 
-parse(Payload, Client = {Sock, FramesRev}, FrameState, Length) ->
+parse(Payload, Client = {Sock, FramesRev}, FrameState, Length, Timeout) ->
     case rabbit_stomp_frame:parse(Payload, FrameState) of
         {ok, Frame, <<>>} ->
-            recv({Sock, lists:reverse([Frame | FramesRev])});
+            recv({Sock, lists:reverse([Frame | FramesRev])}, Timeout);
         {ok, Frame, <<"\n">>} ->
-            recv({Sock, lists:reverse([Frame | FramesRev])});
+            recv({Sock, lists:reverse([Frame | FramesRev])}, Timeout);
         {ok, Frame, Rest} ->
             parse(Rest, {Sock, [Frame | FramesRev]},
-                  rabbit_stomp_frame:initial_state(), Length);
+                  rabbit_stomp_frame:initial_state(), Length, Timeout);
         {more, NewState} ->
-            recv(Client, NewState, 0)
+            recv(Client, NewState, 0, Timeout)
     end.

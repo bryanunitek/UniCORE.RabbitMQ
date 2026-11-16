@@ -36,7 +36,7 @@
          close_source/1,
          close_dest/1,
          ack/3,
-         nack/3,
+         nack/2,
          status/1,
          forward/3,
          pending_count/1
@@ -99,6 +99,7 @@ parse(_Name, {source, Conf}) ->
       uris => Uris,
       prefetch_count => pget(prefetch_count, Conf, 1000),
       delete_after => pget(delete_after, Conf, never),
+      delete_after_duration => pget(delete_after_duration, Conf, undefined),
       predeclared => true,
       source_address => pget(source_address, Conf),
       consumer_args => pget(consumer_args, Conf, []),
@@ -108,6 +109,7 @@ parse_source(Def) ->
     Uris = obfuscated_uris(<<"src-uri">>, Def),
     Address = pget(<<"src-address">>, Def),
     DeleteAfter = pget(<<"src-delete-after">>, Def, <<"never">>),
+    DeleteAfterDuration = pget(<<"src-delete-after-duration">>, Def, undefined),
     PrefetchCount = pget(<<"src-prefetch-count">>, Def, 1000),
     Headers = [],
     SrcCName = pget(<<"src-consumer-name">>, Def, <<>>),
@@ -117,7 +119,8 @@ parse_source(Def) ->
     {#{module => rabbit_amqp10_shovel,
        uris => Uris,
        source_address => Address,
-       delete_after => opt_b2a(DeleteAfter),
+       delete_after => rabbit_shovel_util:parse_delete_after(DeleteAfter),
+       delete_after_duration => DeleteAfterDuration,
        prefetch_count => PrefetchCount,
        predeclared => Predeclared,
        consumer_args => SrcCArgs,
@@ -155,6 +158,7 @@ validate_src_funs(_Def, User) ->
      {<<"src-prefetch-count">>, fun rabbit_parameter_validation:number/2, optional},
      {<<"src-consumer-name">>, fun rabbit_parameter_validation:binary/2, optional},
      {<<"src-delete-after">>, fun validate_amqp10_delete_after/2, optional},
+     {<<"src-delete-after-duration">>, fun rabbit_shovel_util:validate_delete_after_duration/2, optional},
      {<<"src-predeclared">>,  fun rabbit_parameter_validation:boolean/2, optional},
      {<<"src-consumer-args">>, fun rabbit_shovel_util:validate_consumer_args/2, optional}
     ].
@@ -240,7 +244,13 @@ connect(Name, SndSettleMode, Uri, Postfix, Addr, Map, AttachFun, LinkNameOverrid
     %% A better solution would be that the shovel plugin subscribes to event
     %% maintenance_connections_closed to gracefully transfer shovels over to other live nodes.
     Config = Config0#{properties => #{<<"ignore-maintenance">> => {boolean, true}}},
-    {ok, Conn} = amqp10_client:open_connection(Config),
+    Conn = case amqp10_client:open_connection(Config) of
+               {ok, C} ->
+                   C;
+               {error, Reason} ->
+                   rabbit_shovel_util:log_connection_failure(Reason, Uri, Name),
+                   exit({shutdown, {connection_failed, Reason}})
+           end,
     {ok, Sess} = amqp10_client:begin_session(Conn),
     link(Conn),
     LinkName = case LinkNameOverride of
@@ -261,7 +271,8 @@ connect(Name, SndSettleMode, Uri, Postfix, Addr, Map, AttachFun, LinkNameOverrid
     {Conn, Sess, LinkRef}.
 
 -spec init_source(state()) -> state().
-init_source(State = #{source := #{current := #{link := Link},
+init_source(State = #{name := Name,
+                      source := #{current := #{link := Link},
                                   prefetch_count := Prefetch} = Src}) ->
     {Credit, RenewWhenBelow} = {Prefetch, max(1, round(Prefetch/10))},
     ok = amqp10_client:flow_link_credit(Link, Credit, RenewWhenBelow),
@@ -274,9 +285,10 @@ init_source(State = #{source := #{current := #{link := Link},
         0 -> exit({shutdown, autodelete});
         _ -> ok
     end,
-    State#{source => Src#{remaining => Remaining,
-                          remaining_unacked => Remaining,
-                          last_acked_tag => -1}}.
+    Src1 = Src#{remaining => Remaining,
+                remaining_unacked => Remaining,
+                last_acked_tag => -1},
+    State#{source => rabbit_shovel_util:sched_expire_after_duration(Name, Src1)}.
 
 -spec init_dest(state()) -> state().
 init_dest(#{name := Name,
@@ -344,6 +356,9 @@ handle_source({'EXIT', Conn, Reason},
 handle_source({'EXIT', _Pid, {shutdown, {server_initiated_close, _, Reason}}}, _State) ->
     {stop, {inbound_link_or_channel_closure, Reason}};
 
+handle_source({internal, delete_after_duration_expired}, _State) ->
+    {stop, {shutdown, autodelete}};
+
 handle_source(_Msg, _State) ->
     not_handled.
 
@@ -357,8 +372,8 @@ handle_dest({amqp10_disposition, {Result, Tag}},
         case {Unacked, Result} of
             {#{Tag := IncomingTag}, accepted} ->
                 {1, rabbit_shovel_behaviour:ack(IncomingTag, false, State1)};
-            {#{Tag := IncomingTag}, rejected} ->
-                {1, rabbit_shovel_behaviour:nack(IncomingTag, false, State1)};
+            {#{Tag := IncomingTag}, _NotAccepted} ->
+                {1, rabbit_shovel_behaviour:nack([IncomingTag], State1)};
             _ -> % not found - this should ideally not happen
                 ?LOG_WARNING("Shovel ~ts amqp10 destination disposition tag not found: ~tp",
                                           [Name, Tag]),
@@ -407,7 +422,8 @@ handle_dest(_Msg, _State) ->
 
 close_source(#{source := #{current := #{conn := Conn,
                                         session := Sess,
-                                        link := LinkRef}}}) ->
+                                        link := LinkRef}} = Src}) ->
+    _ = rabbit_shovel_util:cancel_expire_after_duration(Src),
     connection_close(Conn, Sess, LinkRef),
     ok;
 close_source(_Config) -> ok.
@@ -424,26 +440,30 @@ close_dest(#{dest := #{current := #{conn := Conn,
     ok;
 close_dest(_Config) -> ok.
 
+%% Only a multiple ack advances `last_acked_tag` because
+%% destinations can confirm out of order.
 -spec ack(Tag :: tag(), Multi :: boolean(), state()) -> state().
 ack(Tag, true, State = #{source := #{current := #{link := LinkRef},
                                      last_acked_tag := LastTag} = Src}) ->
-    First = LastTag + 1,
+    First = case LastTag of
+                -1 -> 0;
+                _ -> serial_number:add(LastTag, 1)
+            end,
     ok = amqp10_client_session:disposition(LinkRef, First, Tag, true, accepted),
     State#{source => Src#{last_acked_tag => Tag}};
-ack(Tag, false, State = #{source := #{current := #{link := LinkRef}} = Src}) ->
+ack(Tag, false, State = #{source := #{current := #{link := LinkRef}}}) ->
     ok = amqp10_client_session:disposition(LinkRef, Tag, Tag, true, accepted),
-    State#{source => Src#{last_acked_tag => Tag}}.
+    State.
 
--spec nack(Tag :: tag(), Multi :: boolean(), state()) -> state().
-nack(Tag, false, State = #{source := #{current := #{link := LinkRef}} = Src}) ->
+-spec nack([tag(), ...], state()) -> state().
+nack(Tags, State = #{source := #{current := #{link := LinkRef}}}) ->
     % the tag is the same as the deliveryid
-    ok = amqp10_client_session:disposition(LinkRef, Tag, Tag, true, rejected),
-    State#{source => Src#{last_acked_tag => Tag}};
-nack(Tag, true, State = #{source := #{current := #{link := LinkRef},
-                                      last_acked_tag := LastTag} = Src}) ->
-    First = LastTag + 1,
-    ok = amqp10_client_session:disposition(LinkRef, First, Tag, true, rejected),
-    State#{source => Src#{last_acked_tag => Tag}}.
+    lists:foreach(fun({First, Last}) ->
+                          ok = amqp10_client_session:disposition(
+                                 LinkRef, First, Last, true,
+                                 {modified, true, false, #{}})
+                  end, serial_number:ranges(Tags)),
+    State.
 
 status(#{dest := #{current := #{link_state := attached}}}) ->
     flow;
@@ -535,9 +555,6 @@ validate_amqp10_map(Name, Terms0) ->
     Str = fun rabbit_parameter_validation:binary/2,
     Validation = [{K, Str, optional} || {K, _} <- Terms],
     rabbit_parameter_validation:proplist(Name, Validation, Terms).
-
-opt_b2a(B) when is_binary(B) -> list_to_atom(binary_to_list(B));
-opt_b2a(N)                   -> N.
 
 decl_queue(_, _, true) ->
     ok;

@@ -10,21 +10,29 @@
 
 -import(rabbit_misc, [pget/2]).
 
--include_lib("amqp_client/include/amqp_client.hrl").
+-include_lib("eunit/include/eunit.hrl").
+-include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 -include("rabbit_stomp_frame.hrl").
--define(DESTINATION, "/queue/bulk-test").
+-define(DESTINATION, <<"/queue/bulk-test">>).
 
 all() ->
     [
         messages_not_dropped_on_disconnect,
-        direct_client_connections_are_not_leaked,
+        connections_not_leaked_on_parse_error,
         stats_are_not_leaked,
         stats,
         heartbeat,
         login_timeout,
+        credential_expires,
+        authenticated_username_used_after_login,
         frame_size,
-        frame_size_huge
+        frame_size_huge,
+        unauthenticated_frame_size_limited,
+        unauthenticated_send_returns_error,
+        unauthenticated_subscribe_returns_error,
+        unauthenticated_disconnect_returns_error,
+        unauthenticated_error_does_not_crash_reader
     ].
 
 merge_app_env(Config) ->
@@ -80,7 +88,7 @@ rpc_count_connections(Config, ConnSpec) ->
     rabbit_ct_broker_helpers:rpc(Config, 0,
                                  ranch_server, count_connections, [ConnSpec]).
 
-direct_client_connections_are_not_leaked(Config) ->
+connections_not_leaked_on_parse_error(Config) ->
     StompPort = get_stomp_port(Config),
     N = count_connections(Config),
     lists:foreach(fun (_) ->
@@ -88,23 +96,21 @@ direct_client_connections_are_not_leaked(Config) ->
                           %% send garbage which trips up the parser
                           gen_tcp:send(Socket, ?GARBAGE),
                           rabbit_stomp_client:send(
-                           Client, "LOL", [{"", ""}])
+                           Client, "LOL", [{<<"">>, <<"">>}])
                   end,
                   lists:seq(1, 100)),
-    ?awaitMatch(N, count_connections(Config), 30_000),
+    rabbit_ct_helpers:await_condition(fun() -> count_connections(Config) =:= N end, 30_000),
     ok.
 
 messages_not_dropped_on_disconnect(Config) ->
     StompPort = get_stomp_port(Config),
     N = count_connections(Config),
     {ok, Client} = rabbit_stomp_client:connect(StompPort),
-    %% STOMP connection registration is asynchronous; wait for it to be
-    %% readable (as in consistency).
     N1 = N + 1,
-    ?awaitMatch(N1, count_connections(Config), 30_000),
+    N1 = count_connections(Config),
     [rabbit_stomp_client:send(
-       Client, "SEND", [{"destination", ?DESTINATION}],
-       [integer_to_list(Count)]) || Count <- lists:seq(1, 1000)],
+       Client, 'SEND', [{<<"destination">>, ?DESTINATION}],
+       [integer_to_binary(Count)]) || Count <- lists:seq(1, 1000)],
     rabbit_stomp_client:disconnect(Client),
     QName = rabbit_misc:r(<<"/">>, queue, <<"bulk-test">>),
     ?awaitMatch(N, count_connections(Config), 30_000),
@@ -132,21 +138,21 @@ stats_are_not_leaked(Config) ->
     Bin = <<"GET / HTTP/1.1\r\nHost: www.rabbitmq.com\r\nUser-Agent: curl/7.43.0\r\nAccept: */*\n\n">>,
     gen_tcp:send(C, Bin),
     gen_tcp:close(C),
-    ?awaitMatch(N, rabbit_ct_broker_helpers:rpc(Config, 0, ets, info, [connection_metrics, size]), 5_000),
+    timer:sleep(1000), %% Wait for stats to be emitted, which it does every 100ms
+    N = rabbit_ct_broker_helpers:rpc(Config, 0, ets, info, [connection_metrics, size]),
     ok.
 
 stats(Config) ->
     StompPort = get_stomp_port(Config),
     {ok, Client} = rabbit_stomp_client:connect(StompPort),
+    timer:sleep(1000), %% Wait for stats to be emitted, which it does every 100ms
     %% Retrieve the connection Pid
-    [Reader] = ?awaitMatch([_], rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp, list, []), 5_000),
+    [Reader] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp, list, []),
     [{_, Pid}] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp_reader,
                                               info, [Reader, [connection]]),
     %% Verify the content of the metrics, garbage_collection must be present
-    [{Pid, Props}] = ?awaitMatch([{Pid, _}],
-                                 rabbit_ct_broker_helpers:rpc(Config, 0, ets, lookup,
-                                                              [connection_metrics, Pid]),
-                                 5_000),
+    [{Pid, Props}] = rabbit_ct_broker_helpers:rpc(Config, 0, ets, lookup,
+                                                  [connection_metrics, Pid]),
     true = proplists:is_defined(garbage_collection, Props),
     0 = proplists:get_value(timeout, Props),
     %% If the coarse entry is present, stats were successfully emitted
@@ -158,16 +164,15 @@ stats(Config) ->
 heartbeat(Config) ->
     StompPort = get_stomp_port(Config),
     {ok, Client} = rabbit_stomp_client:connect("1.2", "guest", "guest", StompPort,
-                                               [{"heart-beat", "5000,7000"}]),
+                                               [{<<"heart-beat">>, <<"5000,7000">>}]),
+    timer:sleep(1000), %% Wait for stats to be emitted, which it does every 100ms
     %% Retrieve the connection Pid
-    [Reader] = ?awaitMatch([_], rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp, list, []), 5_000),
+    [Reader] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp, list, []),
     [{_, Pid}] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp_reader,
                                               info, [Reader, [connection]]),
     %% Verify the content of the heartbeat timeout
-    [{Pid, Props}] = ?awaitMatch([{Pid, _}],
-                                 rabbit_ct_broker_helpers:rpc(Config, 0, ets, lookup,
-                                                              [connection_metrics, Pid]),
-                                 5_000),
+    [{Pid, Props}] = rabbit_ct_broker_helpers:rpc(Config, 0, ets, lookup,
+                                                  [connection_metrics, Pid]),
     5 = proplists:get_value(timeout, Props),
     rabbit_stomp_client:disconnect(Client),
     ok.
@@ -187,15 +192,102 @@ login_timeout(Config) ->
           application, unset_env, [rabbitmq_stomp, login_timeout])
     end.
 
+credential_expires(Config) ->
+    Mod = rabbit_auth_backend_internal,
+    ExpiryTimestamp = os:system_time(second) + 5,
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, meck, new, [Mod, [no_link, passthrough]]),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, meck, expect, [Mod, expiry_timestamp, 1, ExpiryTimestamp]),
+    StompPort = get_stomp_port(Config),
+    try
+        {ok, {Socket, _}} = rabbit_stomp_client:connect("1.2", "guest", "guest",
+                                                        StompPort, []),
+        {error, timeout} = gen_tcp:recv(Socket, 0, 2000),
+        {ok, Data} = gen_tcp:recv(Socket, 0, 30000),
+        {ok, Frame, _} = rabbit_stomp_frame:parse(
+                           Data, rabbit_stomp_frame:initial_state()),
+        'ERROR' = Frame#stomp_frame.command,
+        {ok, <<"Credential expired">>} = rabbit_stomp_frame:header(
+                                           Frame, <<"message">>),
+        {error, closed} = gen_tcp:recv(Socket, 0, 30000)
+    after
+        ok = rabbit_ct_broker_helpers:rpc(Config, 0, meck, unload, [Mod])
+    end.
+
+authenticated_username_used_after_login(Config) ->
+    case rabbit_ct_helpers:is_mixed_versions() of
+        false ->
+            authenticated_username_used_after_login0(Config);
+        true ->
+            {skip, "Should not run in mixed version environments"}
+    end.
+
+authenticated_username_used_after_login0(Config) ->
+    Username = <<"stomp-identity">>,
+    Rpc = fun(M, F, A) -> rabbit_ct_broker_helpers:rpc(Config, 0, M, F, A) end,
+    ok = Rpc(rabbit_auth_backend_internal, add_user, [Username, Username, <<"acting-user">>]),
+    ok = Rpc(rabbit_auth_backend_internal, set_permissions,
+             [Username, <<"/">>, <<".*">>, <<".*">>, <<".*">>, <<"acting-user">>]),
+    {ok, TrackSource} = Rpc(application, get_env, [rabbit, track_auth_attempt_source]),
+    ok = Rpc(application, set_env, [rabbit, track_auth_attempt_source, true]),
+    ok = Rpc(rabbit_core_metrics, reset_auth_attempt_metrics, []),
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    Mocked = [rabbit_auth_backend_internal, rabbit_event],
+    try
+        lists:foreach(fun(Mod) -> ok = Rpc(meck, new, [Mod, [no_link, passthrough]]) end,
+                      Mocked),
+        ok = Rpc(meck, expect, [rabbit_auth_backend_internal, user_login_authentication, 2,
+                                {ok, #auth_user{username = Username, tags = [], impl = none}}]),
+        {ok, Client} = rabbit_stomp_client:connect("1.2", "login-header", "password",
+                                                   get_stomp_port(Config), []),
+        rabbit_stomp_client:send(
+          Client, 'SUBSCRIBE', [{<<"destination">>, <<"/topic/identity">>},
+                                {<<"id">>, <<"identity">>}, {<<"receipt">>, <<"r">>},
+                                {<<"durable">>, <<"true">>}, {<<"auto-delete">>, <<"false">>}]),
+        {#stomp_frame{command = 'RECEIPT'}, Client1} = rabbit_stomp_client:recv(Client),
+        rabbit_stomp_client:send(
+          Client1, 'SUBSCRIBE', [{<<"destination">>, <<"/topic/identity-refused">>},
+                                 {<<"id">>, <<"identity-refused">>},
+                                 {<<"durable">>, <<"true">>}, {<<"auto-delete">>, <<"false">>},
+                                 {<<"x-queue-type">>, <<"stream">>}, {<<"ack">>, <<"auto">>}]),
+        {#stomp_frame{command = 'ERROR'}, _} = rabbit_stomp_client:recv(Client1, 30_000),
+
+        Events = [binding_created, binding_deleted, queue_deleted],
+        ?awaitMatch(
+           [{binding_created, [Username]}, {binding_deleted, [Username]},
+            {queue_deleted, [Username]}],
+           [{Type, lists:usort(
+                     [proplists:get_value(user_who_performed_action, Props)
+                      || {_, {rabbit_event, notify, [T, Props | _]}, _}
+                             <- Rpc(meck, history, [rabbit_event]),
+                         T =:= Type])}
+            || Type <- Events],
+           30_000),
+        Attempts = [A || A <- Rpc(rabbit_core_metrics, get_auth_attempts_by_source, []),
+                         pget(protocol, A) =:= <<"stomp">>],
+        ?assertEqual([Username], lists:usort([pget(username, A) || A <- Attempts]))
+    after
+        lists:foreach(fun(Mod) -> _ = Rpc(meck, unload, [Mod]) end, Mocked),
+        _ = Rpc(rabbit_amqqueue, delete_with,
+                [rabbit_misc:r(<<"/">>, queue,
+                               rabbit_stomp_util:subscription_queue_name(
+                                 <<"identity">>, <<"identity">>, #stomp_frame{headers = #{}})),
+                 false, false, <<"acting-user">>]),
+        ok = Rpc(application, set_env, [rabbit, track_auth_attempt_source, TrackSource]),
+        _ = Rpc(rabbit_auth_backend_internal, delete_user, [Username, <<"acting-user">>])
+    end.
+
 frame_size(Config) ->
     rabbit_ct_broker_helpers:rpc(
       Config, 0,
       application, set_env, [rabbitmq_stomp, max_frame_size, 80]),
     StompPort = get_stomp_port(Config),
     {ok, Client} = rabbit_stomp_client:connect("1.2", "guest", "guest", StompPort,
-                                               [{"heart-beat", "5000,7000"}]),
+                                               [{<<"heart-beat">>, <<"5000,7000">>}]),
     ok = rabbit_stomp_client:send(
-      Client, "SEND", [{"destination", "qwe"}],
+      Client, 'SEND', [{<<"destination">>, <<"qwe">>}],
       ["Lorem ipsum dolor sit amet viverra fusce. "
        "Lorem ipsum dolor sit amet viverra fusce. "
        "Lorem ipsum dolor sit amet viverra fusce."
@@ -212,10 +304,62 @@ frame_size_huge(Config) ->
       application, set_env, [rabbitmq_stomp, max_frame_size, 700]),
     StompPort = get_stomp_port(Config),
     {ok, Client} = rabbit_stomp_client:connect("1.2", "guest", "guest", StompPort,
-                                               [{"heart-beat", "5000,7000"}]),
+                                               [{<<"heart-beat">>, <<"5000,7000">>}]),
     rabbit_stomp_client:send(
-      Client, "SEND", [{"destination", "qwe"}],
+      Client, 'SEND', [{<<"destination">>, <<"qwe">>}],
       [base64:encode(crypto:strong_rand_bytes(100000000))]),
     {S, _} = Client,
     {error, closed} = gen_tcp:recv(S, 0, 500),
+    ok.
+
+unauthenticated_frame_size_limited(Config) ->
+    StompPort = get_stomp_port(Config),
+    {ok, Sock} = gen_tcp:connect(localhost, StompPort, [{active, false}, binary]),
+    Pad = binary:copy(<<"a">>, 70000),
+    Frame = <<"CONNECT\naccept-version:1.2\nx-pad:", Pad/binary, "\n">>,
+    ok = gen_tcp:send(Sock, Frame),
+    {error, closed} = gen_tcp:recv(Sock, 0, 5000),
+    gen_tcp:close(Sock).
+
+%% Sending a SEND frame before CONNECT must produce an ERROR
+%% frame, not crash the reader process.
+unauthenticated_send_returns_error(Config) ->
+    StompPort = get_stomp_port(Config),
+    {ok, Sock} = gen_tcp:connect(localhost, StompPort, [{active, false}, binary]),
+    ok = gen_tcp:send(Sock, <<"SEND\ndestination:/queue/foo\n\nhello\0">>),
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    {ok, Frame, _} = rabbit_stomp_frame:parse(Data, rabbit_stomp_frame:initial_state()),
+    'ERROR' = Frame#stomp_frame.command,
+    gen_tcp:close(Sock).
+
+unauthenticated_subscribe_returns_error(Config) ->
+    StompPort = get_stomp_port(Config),
+    {ok, Sock} = gen_tcp:connect(localhost, StompPort, [{active, false}, binary]),
+    ok = gen_tcp:send(Sock, <<"SUBSCRIBE\ndestination:/queue/foo\nid:0\n\n\0">>),
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    {ok, Frame, _} = rabbit_stomp_frame:parse(Data, rabbit_stomp_frame:initial_state()),
+    'ERROR' = Frame#stomp_frame.command,
+    gen_tcp:close(Sock).
+
+unauthenticated_disconnect_returns_error(Config) ->
+    StompPort = get_stomp_port(Config),
+    {ok, Sock} = gen_tcp:connect(localhost, StompPort, [{active, false}, binary]),
+    ok = gen_tcp:send(Sock, <<"DISCONNECT\n\n\0">>),
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    {ok, Frame, _} = rabbit_stomp_frame:parse(Data, rabbit_stomp_frame:initial_state()),
+    'ERROR' = Frame#stomp_frame.command,
+    gen_tcp:close(Sock).
+
+%% After rejecting an unauthenticated frame, the reader must still
+%% be alive and able to accept a proper CONNECT.
+unauthenticated_error_does_not_crash_reader(Config) ->
+    StompPort = get_stomp_port(Config),
+    N = count_connections(Config),
+    {ok, Sock} = gen_tcp:connect(localhost, StompPort, [{active, false}, binary]),
+    ok = gen_tcp:send(Sock, <<"SEND\ndestination:/queue/foo\n\nhello\0">>),
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    {ok, ErrFrame, _} = rabbit_stomp_frame:parse(Data, rabbit_stomp_frame:initial_state()),
+    'ERROR' = ErrFrame#stomp_frame.command,
+    gen_tcp:close(Sock),
+    ?awaitMatch(N, count_connections(Config), 5_000),
     ok.

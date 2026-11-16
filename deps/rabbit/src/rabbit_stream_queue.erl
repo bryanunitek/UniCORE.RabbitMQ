@@ -6,7 +6,6 @@
 %%
 
 -module(rabbit_stream_queue).
--feature(maybe_expr, enable).
 
 -include("mc.hrl").
 
@@ -71,6 +70,7 @@
 
 -include("amqqueue.hrl").
 -include("rabbit_queue_type.hrl").
+-include("rabbit_stream_queue.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("kernel/include/logger.hrl").
 -include_lib("amqp10_common/include/amqp10_filter.hrl").
@@ -158,6 +158,7 @@ declare(Q, _Node) when ?amqqueue_is_stream(Q) ->
         ok ?= rabbit_queue_type_util:check_non_durable(Q),
         ok ?= check_max_segment_size_bytes(Q),
         ok ?= check_filter_size(Q),
+        ok ?= check_initial_offset(Q),
         create_stream(Q)
     end.
 
@@ -188,6 +189,30 @@ check_filter_size(Q) ->
              "Invalid value for x-stream-filter-size-bytes", []};
         _ ->
             ok
+    end.
+
+check_initial_offset(Q) ->
+    Args = amqqueue:get_arguments(Q),
+    case rabbit_misc:table_lookup(Args, <<"x-stream-initial-offset">>) of
+        undefined ->
+            ok;
+        {_Type, Offset} when is_integer(Offset) andalso Offset > ?MAX_STREAM_INITIAL_OFFSET ->
+            {protocol_error, precondition_failed,
+             "Exceeded max value for x-stream-initial-offset", []};
+        {_Type, Offset} when is_integer(Offset) andalso Offset >= 0 ->
+            case rabbit_feature_flags:is_enabled('rabbitmq_4.4.0') of
+                true ->
+                    ok;
+                false ->
+                    %% A replica on an older node would start its log at offset 0 and
+                    %% then reject the writer's first chunk as out of order.
+                    {protocol_error, precondition_failed,
+                     "Feature flag 'rabbitmq_4.4.0' is required to declare a "
+                     "stream with x-stream-initial-offset", []}
+            end;
+        {_Type, _Offset} ->
+            {protocol_error, precondition_failed,
+             "x-stream-initial-offset value must be a non-negative integer", []}
     end.
 
 create_stream(Q0) ->
@@ -1191,8 +1216,7 @@ delete_replica_with_retry(Q, Node) ->
 grow(Node, VhostSpec, QueueSpec, Strategy) ->
     ?LOG_INFO("Adding stream replicas on node ~ts", [Node]),
     Running = rabbit_nodes:list_running(),
-    Streams = [Q || Q <- rabbit_amqqueue:list(),
-                    amqqueue:get_type(Q) == ?MODULE,
+    Streams = [Q || Q <- rabbit_amqqueue:list_by_type(?MODULE),
                     begin
                         Nodes = get_nodes(Q),
                         not lists:member(Node, Nodes) andalso
@@ -1256,14 +1280,27 @@ update_stream_conf(Q, #{} = Conf) when ?is_amqqueue(Q) ->
                                              fun policy_precedence/2, Q),
     FilterSizeBytes = args_policy_lookup(<<"stream-filter-size-bytes">>,
                                          fun policy_precedence/2, Q),
+    %% Fixed at creation time, so it is never taken from a policy.
+    InitialOffset = initial_offset(Q),
     Retention = lists:filter(fun({_, R}) ->
                                      R =/= undefined
                              end, [{max_bytes, MaxBytes},
                                    {max_age, MaxAge}]),
     add_if_defined(
-      filter_size, FilterSizeBytes,
-      add_if_defined(max_segment_size_bytes, MaxSegmentSizeBytes,
-                     Conf#{retention => Retention})).
+      initial_offset, InitialOffset,
+      add_if_defined(
+        filter_size, FilterSizeBytes,
+        add_if_defined(max_segment_size_bytes, MaxSegmentSizeBytes,
+                       Conf#{retention => Retention}))).
+
+initial_offset(Q) ->
+    case rabbit_misc:table_lookup(amqqueue:get_arguments(Q),
+                                  <<"x-stream-initial-offset">>) of
+        {_Type, Offset} ->
+            Offset;
+        undefined ->
+            undefined
+    end.
 
 add_if_defined(_, undefined, Map) ->
     Map;
@@ -1439,10 +1476,7 @@ chunk_iterator(#stream{credit = Credit,
                       false ->
                           Str0#stream{log = Log}
                   end,
-            {end_of_stream, Str};
-        {error, Err} ->
-            ?LOG_INFO("stream client: failed to create chunk iterator ~p", [Err]),
-            exit(Err)
+            {end_of_stream, Str}
     end.
 
 %% Deliver each record of an uncompressed sub batch individually.
@@ -1499,6 +1533,7 @@ capabilities() ->
       queue_arguments => [<<"x-max-length-bytes">>, <<"x-queue-type">>,
                           <<"x-max-age">>, <<"x-stream-max-segment-size-bytes">>,
                           <<"x-stream-filter-size-bytes">>,
+                          <<"x-stream-initial-offset">>,
                           <<"x-initial-cluster-size">>, <<"x-queue-leader-locator">>],
       consumer_arguments => [<<"x-stream-offset">>,
                              <<"x-stream-filter">>,
@@ -1633,7 +1668,48 @@ drain(TransferCandidates) ->
     case whereis(rabbit_stream_coordinator) of
         undefined -> ok;
         _Pid -> transfer_leadership_of_stream_coordinator(TransferCandidates)
-    end.
+    end,
+    transfer_leadership_of_local_stream_leaders(TransferCandidates).
+
+-spec transfer_leadership_of_local_stream_leaders([node()]) -> ok.
+transfer_leadership_of_local_stream_leaders([]) ->
+    ok;
+transfer_leadership_of_local_stream_leaders(TransferCandidates) ->
+    LocalLeaderQueues = list_local_leaders(),
+    ?LOG_INFO("transferring leadership of ~b local stream leaders...",
+              [length(LocalLeaderQueues)]),
+    QueuesChunked = ra_lib:lists_chunk(256, LocalLeaderQueues),
+    [begin
+         Refs =
+             [begin
+                  Nodes = get_nodes(Q),
+                  case rabbit_maintenance:random_primary_replica_transfer_candidate_node(TransferCandidates, Nodes) of
+                      {ok, PreferredNode} ->
+                          {_, Ref} = spawn_monitor(
+                                       fun() ->
+                                               rabbit_stream_coordinator:restart_stream(Q, #{preferred_leader_node => PreferredNode})
+                                       end),
+                          Ref;
+                      undefined ->
+                          undefined
+                  end
+              end || Q <- Queues],
+         Timeout = (5000 + (100 * length(Queues))),
+         [receive
+              {'DOWN', Ref, process, _, _} ->
+                  ok
+          after Timeout ->
+                    erlang:demonitor(Ref, [flush]),
+                    ok
+          end || Ref <- Refs, Ref =/= undefined],
+         timer:sleep(1000)
+     end || Queues <- QueuesChunked],
+    ok.
+
+list_local_leaders() ->
+    [Q || Q <- rabbit_amqqueue:list_by_type(?MODULE),
+          amqqueue:get_state(Q) =/= crashed,
+          amqqueue:get_leader_node(Q) =:= node()].
 
 revive() ->
     ok.
