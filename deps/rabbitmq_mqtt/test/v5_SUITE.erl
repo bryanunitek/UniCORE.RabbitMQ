@@ -60,6 +60,8 @@ cluster_size_1_tests() ->
      client_set_max_packet_size_connack,
      client_set_max_packet_size_invalid,
      message_expiry,
+     message_expiry_limit,
+     message_expiry_limit_will,
      message_expiry_will_message,
      message_expiry_retained_message,
      session_expiry_classic_queue_disconnect_decrease,
@@ -128,6 +130,8 @@ cluster_size_1_tests() ->
      topic_alias_disallowed,
      topic_alias_retained_message,
      topic_alias_disallowed_retained_message,
+     topic_alias_max_packet_size,
+     topic_alias_max_packet_size_retained_message,
      extended_auth,
      headers_exchange,
      consistent_hash_exchange
@@ -336,6 +340,69 @@ message_expiry(Config) ->
     ok = emqtt:disconnect(Sub2),
     Sub3 = connect(ClientId, Config, [{clean_start, true}]),
     ok = emqtt:disconnect(Sub3).
+
+message_expiry_limit(Config) ->
+    Topic = atom_to_binary(?FUNCTION_NAME),
+    Ch = rabbit_ct_client_helpers:open_channel(Config),
+    #'queue.declare_ok'{queue = Q} =
+        amqp_channel:call(Ch, #'queue.declare'{exclusive = true}),
+    #'queue.bind_ok'{} =
+        amqp_channel:call(Ch, #'queue.bind'{queue = Q,
+                                            exchange = <<"amq.topic">>,
+                                            routing_key = Topic}),
+    Sub = connect(<<"subscriber">>, Config),
+    {ok, _, [1]} = emqtt:subscribe(Sub, Topic, qos1),
+    Pub = connect(<<"publisher">>, Config),
+    ok = emqtt:publish(Pub, Topic, #{'Message-Expiry-Interval' => 315_360_001},
+                       <<"m1">>, [{qos, 0}]),
+    {ok, _} = emqtt:publish(Pub, Topic, #{'Message-Expiry-Interval' => 16#FFFFFFFF},
+                            <<"m2">>, [{qos, 1}, {retain, true}]),
+    lists:foreach(
+      fun(Payload) ->
+              receive {publish, #{client_pid := Sub,
+                                  payload := Payload,
+                                  properties := #{'Message-Expiry-Interval' := MEI}}} ->
+                          assert_message_expiry_interval(315_360_000, MEI)
+              after ?TIMEOUT -> ct:fail({missing, Payload})
+              end,
+              ?assertMatch(
+                 {#'basic.get_ok'{},
+                  #amqp_msg{props = #'P_basic'{expiration = <<"315360000000">>},
+                            payload = Payload}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = Q, no_ack = true}))
+      end, [<<"m1">>, <<"m2">>]),
+    RetainedSub = connect(<<"retained-subscriber">>, Config),
+    {ok, _, [1]} = emqtt:subscribe(RetainedSub, Topic, qos1),
+    receive {publish, #{client_pid := RetainedSub,
+                        retain := true,
+                        payload := <<"m2">>,
+                        properties := #{'Message-Expiry-Interval' := RetainedMEI}}} ->
+                assert_message_expiry_interval(315_360_000, RetainedMEI)
+    after ?TIMEOUT -> ct:fail(missing_retained)
+    end,
+    {ok, _} = emqtt:publish(Pub, Topic, #{}, <<>>, [{qos, 1}, {retain, true}]),
+    ok = emqtt:disconnect(Pub),
+    ok = emqtt:disconnect(Sub),
+    ok = emqtt:disconnect(RetainedSub),
+    ok = rabbit_ct_client_helpers:close_channels_and_connection(Config, 0).
+
+message_expiry_limit_will(Config) ->
+    Topic = atom_to_binary(?FUNCTION_NAME),
+    Sub = connect(<<"subscriber">>, Config),
+    {ok, _, [1]} = emqtt:subscribe(Sub, Topic, qos1),
+    Pub = connect(<<"publisher">>, Config,
+                  [{will_topic, Topic},
+                   {will_payload, <<"will">>},
+                   {will_qos, 1},
+                   {will_props, #{'Message-Expiry-Interval' => 16#FFFFFFFF}}]),
+    ok = emqtt:disconnect(Pub, ?RC_DISCONNECT_WITH_WILL),
+    receive {publish, #{client_pid := Sub,
+                        payload := <<"will">>,
+                        properties := #{'Message-Expiry-Interval' := MEI}}} ->
+                assert_message_expiry_interval(315_360_000, MEI)
+    after ?TIMEOUT -> ct:fail(missing_will)
+    end,
+    ok = emqtt:disconnect(Sub).
 
 message_expiry_will_message(Config) ->
     NumExpiredBefore = dead_letter_metric(messages_dead_lettered_expired_total, Config),
@@ -1607,11 +1674,11 @@ will_delay(WillDelay, SessionExpiry, ClientId, Config)
     ok = emqtt:disconnect(Sub).
 
 will_delay_session_expiry_zero(Config) ->
-    Topic = <<"a/b">>,
-    Msg = <<"msg">>,
+    Topic = Msg = atom_to_binary(?FUNCTION_NAME),
     Opts = [{will_props, #{'Will-Delay-Interval' => 1}},
             {will_topic, Topic},
-            {will_payload, Msg}],
+            {will_payload, Msg},
+            {will_retain, true}],
     C = connect(?FUNCTION_NAME, Config, Opts),
     Sub = connect(<<"subscriber">>, Config),
     {ok, _, [0]} = emqtt:subscribe(Sub, Topic),
@@ -1621,7 +1688,20 @@ will_delay_session_expiry_zero(Config) ->
     receive {publish, #{payload := Msg}} -> ok
     after ?TIMEOUT -> ct:fail(will_message_timeout)
     end,
-    ok = emqtt:disconnect(Sub).
+    ok = emqtt:disconnect(Sub),
+
+    RPid = rpc(Config, rabbit_mqtt_retainer_sup, start_child_for_vhost, [<<"/">>]),
+    eventually(?_assertNotEqual(undefined, rpc(Config, rabbit_mqtt_retainer, fetch, [RPid, Topic]))),
+    Sub2 = connect(<<"subscriber2">>, Config),
+    {ok, _, [0]} = emqtt:subscribe(Sub2, Topic),
+    receive {publish, #{payload := Msg,
+                        retain := true,
+                        properties := Props}} ->
+                ?assertNot(maps:is_key('Will-Delay-Interval', Props))
+    after ?TIMEOUT -> ct:fail(retained_will_message_timeout)
+    end,
+    {ok, _} = emqtt:publish(Sub2, Topic, <<>>, [{retain, true}, {qos, 1}]),
+    ok = emqtt:disconnect(Sub2).
 
 will_delay_reconnect_no_will(Config) ->
     Topic = <<"my/topic">>,
@@ -2217,6 +2297,38 @@ topic_alias_in_retained_message0(Config, TopicAliasMax, TopicAlias, ExpectedProp
     after ?TIMEOUT -> ct:fail("Did not receive retained message")
     end,
     ok = emqtt:disconnect(C).
+
+topic_alias_max_packet_size(Config) ->
+    Topic = ClientId = atom_to_binary(?FUNCTION_NAME),
+    MaxPacketSize = 500,
+    C = connect(ClientId, Config, [{properties, #{'Topic-Alias-Maximum' => 1,
+                                                 'Maximum-Packet-Size' => MaxPacketSize}}]),
+    {ok, _, [1]} = emqtt:subscribe(C, Topic, qos1),
+    {ok, _} = emqtt:publish(C, Topic, binary:copy(<<"x">>, MaxPacketSize + 1), qos1),
+    {ok, _} = emqtt:publish(C, Topic, <<"m2">>, qos1),
+    assert_first_topic_alias(Topic, <<"m2">>),
+    ok = emqtt:disconnect(C).
+
+topic_alias_max_packet_size_retained_message(Config) ->
+    Topic = ClientId = atom_to_binary(?FUNCTION_NAME),
+    MaxPacketSize = 500,
+    C = connect(ClientId, Config, [{properties, #{'Topic-Alias-Maximum' => 1,
+                                                 'Maximum-Packet-Size' => MaxPacketSize}}]),
+    {ok, _} = emqtt:publish(C, Topic, binary:copy(<<"x">>, MaxPacketSize + 1),
+                            [{retain, true}, {qos, 1}]),
+    {ok, _, [1]} = emqtt:subscribe(C, Topic, qos1),
+    {ok, _} = emqtt:publish(C, Topic, <<"m2">>, qos1),
+    assert_first_topic_alias(Topic, <<"m2">>),
+    {ok, _} = emqtt:publish(C, Topic, <<>>, [{retain, true}, {qos, 1}]),
+    ok = emqtt:disconnect(C).
+
+assert_first_topic_alias(Topic, Payload) ->
+    receive {publish, #{payload := Payload} = Publish} ->
+                ?assertMatch(#{topic := Topic,
+                               properties := #{'Topic-Alias' := 1}},
+                             Publish)
+    after ?TIMEOUT -> ct:fail({missing_publish, Payload})
+    end.
 
 extended_auth(Config) ->
     {C, Connect} = start_client(?FUNCTION_NAME, Config, 0,

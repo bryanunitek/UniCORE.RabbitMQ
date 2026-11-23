@@ -17,6 +17,8 @@
 
 -export([init/0,
          reset/0,
+         do_reset/0,
+         ensure_not_booting_or_stopping/0,
          force_reset/0,
          force_load_on_next_boot/0,
          is_virgin_node/0, is_virgin_node/1,
@@ -67,7 +69,7 @@ init() ->
             ok
     end,
 
-    Ret = init_using_khepri(IsVirgin),
+    Ret = init_using_khepri(),
     case Ret of
         ok ->
             ?LOG_DEBUG(
@@ -92,11 +94,11 @@ pre_init(IsVirgin) ->
     OtherMembers = rabbit_nodes:nodes_excl_me(Members),
     rabbit_db_cluster:ensure_feature_flags_are_in_sync(OtherMembers, IsVirgin).
 
-init_using_khepri(IsVirgin) ->
+init_using_khepri() ->
     ?LOG_DEBUG(
       "DB: initialize Khepri",
       #{domain => ?RMQLOG_DOMAIN_DB}),
-    rabbit_khepri:init(IsVirgin).
+    rabbit_khepri:init().
 
 init_finished() ->
     %% Used during initialisation by rabbit_logger_exchange_h.erl
@@ -116,12 +118,41 @@ clear_init_finished() ->
     _ = persistent_term:erase(?PT_KEY_INIT_FINISHED),
     ok.
 
--spec reset() -> ok.
+-spec reset() -> Ret when
+      Ret :: ok | {error, {unexpected_boot_state, BootState}},
+      BootState :: rabbit_boot_state:boot_state().
 %% @doc Resets the database and the node.
+%%
+%% A booting or stopping node is refused because the reset deletes the
+%% metadata store it uses.
 
 reset() ->
+    maybe
+        ok ?= ensure_not_booting_or_stopping(),
+        do_reset()
+    end.
+
+-spec do_reset() -> ok.
+%% @doc Resets the database and the node without checking the boot state.
+%%
+%% @private
+
+do_reset() ->
     ok = reset_using_khepri(),
     post_reset().
+
+-spec ensure_not_booting_or_stopping() -> Ret when
+      Ret :: ok | {error, {unexpected_boot_state, BootState}},
+      BootState :: rabbit_boot_state:boot_state().
+%% @private
+
+ensure_not_booting_or_stopping() ->
+    case rabbit_boot_state:get() of
+        BootState when BootState =:= stopped orelse BootState =:= ready ->
+            ok;
+        BootState ->
+            {error, {unexpected_boot_state, BootState}}
+    end.
 
 reset_using_khepri() ->
     ?LOG_DEBUG(

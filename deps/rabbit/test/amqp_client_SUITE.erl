@@ -11,6 +11,7 @@
 -include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("amqp10_common/include/amqp10_framing.hrl").
+-include_lib("rabbitmq_amqp_client/include/rabbitmq_amqp_client.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 
 -compile([nowarn_export_all,
@@ -120,6 +121,8 @@ groups() ->
        resource_alarm_send_many,
        max_message_size_client_to_server,
        max_message_size_server_to_client,
+       multi_transfer_empty_fragments,
+       multi_transfer_max_message_size_exceeded,
        global_counters,
        stream_bloom_filter,
        available_messages_classic_queue,
@@ -130,6 +133,7 @@ groups() ->
        trace_stream,
        user_id,
        sections_out_of_order,
+       message_section_too_large,
        message_ttl,
        plugin,
        idle_time_out_on_server,
@@ -152,6 +156,8 @@ groups() ->
        modified_quorum_queue_deferral_token,
        modified_quorum_queue_deferral_token_ranged_disposition,
        disposition_reversed_range_rejected,
+       flow_non_boolean_drain_quorum_queue,
+       flow_non_boolean_echo_quorum_queue,
        session_flow_max_incoming_window,
        modified_quorum_queue_deferral_token_precedes_backlog,
        modified_quorum_queue_deferral_token_survives_in_flight_credit_req,
@@ -203,6 +209,7 @@ groups() ->
        x_cc_annotation_exchange_routing_key_empty,
        x_cc_annotation_queue,
        x_cc_annotation_null,
+       non_utf8_names,
        bad_x_cc_annotation_exchange,
        decimal_types,
        consumer_timeout_quorum_queue_policy,
@@ -271,7 +278,10 @@ init_per_group(Group, Config) ->
     Suffix = rabbit_ct_helpers:testcase_absname(Config, "", "-"),
     Config1 = rabbit_ct_helpers:set_config(
                 Config, [{rmq_nodes_count, Nodes},
-                         {rmq_nodename_suffix, Suffix}]),
+                         {rmq_nodename_suffix, Suffix},
+                         %% `tcp_back_pressure_rabbitmq_internal_flow/2` stops reading
+                         %% from the socket, so the writer's send times out.
+                         {ignored_crashes, ["{writer,send_failed,timeout}"]}]),
     rabbit_ct_helpers:run_setup_steps(
       Config1,
       rabbit_ct_broker_helpers:setup_steps() ++
@@ -759,7 +769,9 @@ modified_quorum_queue(Config) ->
             #{<<"x-opt-requeued-by">> => {array, utf8, [{utf8, Receiver2Name} | L0]},
               <<"x-opt-requeue-reason">> => {list, [{symbol, <<"reason 2">>} | L1]},
               <<"x-opt-my-map">> => {map, L2 ++ [{{symbol, <<"k3">>}, {symbol, <<"val 3">>}}]},
-              <<"x-other">> => 99}}),
+              <<"x-other">> => 99,
+              <<"x-double">> => 1.5,
+              <<"x-float">> => {float, -2.5}}}),
 
     {ok, M2e} = amqp10_client:get_msg(Receiver1),
     ?assertEqual([<<"m2">>], amqp10_msg:body(M2e)),
@@ -773,7 +785,9 @@ modified_quorum_queue(Config) ->
                                           {{utf8, <<"k2">>}, {ulong, 2}},
                                           {{symbol, <<"k3">>}, {symbol, <<"val 3">>}}
                                          ],
-                   <<"x-other">> := 99}, amqp10_msg:message_annotations(M2e)),
+                   <<"x-other">> := 99,
+                   <<"x-double">> := 1.5,
+                   <<"x-float">> := -2.5}, amqp10_msg:message_annotations(M2e)),
     ok = amqp10_client:settle_msg(Receiver1, M2e, modified),
 
     %% Test that we can consume via AMQP 0.9.1
@@ -886,7 +900,7 @@ modified_quorum_queue_deferral_token(Config) ->
 
     {ok, Receiver} = amqp10_client:attach_receiver_link(
                        Session, <<"receiver">>, Address, unsettled),
-    OutputHandle = element(4, Receiver),
+    OutputHandle = amqp10_client:link_handle(Receiver),
     FarFuture = erlang:system_time(millisecond) + 3_600_000,
 
     %% Park m1 under Token1 with a delivery time far in the future.
@@ -1105,6 +1119,50 @@ modified_quorum_queue_deferral_token_ranged_disposition(Config) ->
                  rabbitmq_amqp_client:delete_queue(LinkPair, QName)),
     ok = close(Init).
 
+flow_non_boolean_drain_quorum_queue(Config) ->
+    flow_non_boolean_field(Config, drain).
+
+flow_non_boolean_echo_quorum_queue(Config) ->
+    flow_non_boolean_field(Config, echo).
+
+flow_non_boolean_field(Config, Field) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    {Connection, Session, LinkPair} = init(Config),
+    {ok, #{type := <<"quorum">>}} = rabbitmq_amqp_client:declare_queue(
+                                      LinkPair, QName,
+                                      #{arguments => #{<<"x-queue-type">> => {utf8, <<"quorum">>}}}),
+    Address = rabbitmq_amqp_address:queue(QName),
+    {ok, Sender} = amqp10_client:attach_sender_link(Session, <<"sender">>, Address),
+    ok = wait_for_credit(Sender),
+    ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<"t1">>, <<"m1">>, true)),
+    ok = amqp10_client:detach_link(Sender),
+
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"receiver">>, Address, unsettled),
+    OutputHandle = amqp10_client:link_handle(Receiver),
+    Flow0 = #'v1_0.flow'{link_credit = {uint, 1}},
+    Flow = case Field of
+               drain -> Flow0#'v1_0.flow'{drain = {ubyte, 1}};
+               echo -> Flow0#'v1_0.flow'{echo = {ubyte, 1}}
+           end,
+    ok = amqp10_client_session:flow_link(Session, OutputHandle, Flow, never),
+    receive
+        {amqp10_event,
+         {session, Session,
+          {ended, #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INVALID_FIELD}}}} -> ok
+    after 30000 -> flush(missing_ended),
+                   ct:fail("did not receive expected error")
+    end,
+    ok = close_connection_sync(Connection),
+
+    Init2 = {_, Session2, LinkPair2} = init(Config),
+    {ok, Receiver2} = amqp10_client:attach_receiver_link(
+                        Session2, <<"receiver2">>, Address, settled),
+    {ok, M1} = amqp10_client:get_msg(Receiver2),
+    ?assertEqual([<<"m1">>], amqp10_msg:body(M1)),
+    {ok, _} = rabbitmq_amqp_client:delete_queue(LinkPair2, QName),
+    ok = close(Init2).
+
 %% A reversed disposition range ends the session with amqp:invalid-field.
 disposition_reversed_range_rejected(Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
@@ -1218,57 +1276,15 @@ modified_quorum_queue_deferral_token_too_many_across_stashed_flows(Config) ->
     {ok, Receiver} = amqp10_client:attach_receiver_link(
                        Session, <<"receiver">>, Address, unsettled),
     OutputHandle = element(4, Receiver),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 30000 -> ct:fail({missing_attached, ?LINE})
+    end,
     Tokens1 = [{utf8, integer_to_binary(N)} || N <- lists:seq(1, 200)],
     Tokens2 = [{utf8, integer_to_binary(N)} || N <- lists:seq(201, 300)],
-    %% Fire three `FLOW` frames back-to-back, no wait in between: the
-    %% 2nd and 3rd (300 tokens combined) should land in the
-    %% `stashed_credit_req` path while the 1st `FLOW`'s credit request
-    %% is still in flight.
-    ok = amqp10_client_session:flow_link(
-           Session, OutputHandle,
-           #'v1_0.flow'{link_credit = {uint, 1}},
-           never),
-    ok = amqp10_client_session:flow_link(
-           Session, OutputHandle,
-           #'v1_0.flow'{
-              link_credit = {uint, 1},
-              properties = {map, [{{symbol, <<"rabbitmq:deferral-tokens">>},
-                                   {array, utf8, Tokens1}}]}},
-           never),
-    ok = amqp10_client_session:flow_link(
-           Session, OutputHandle,
-           #'v1_0.flow'{
-              link_credit = {uint, 1},
-              properties = {map, [{{symbol, <<"rabbitmq:deferral-tokens">>},
-                                   {array, utf8, Tokens2}}]}},
-           never),
-    receive
-        {amqp10_event,
-         {session, Session,
-          {ended, #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INVALID_FIELD}}}} -> ok
-    after 30000 -> flush(missing_ended),
-                   ct:fail("did not receive expected error")
-    end,
-    ok = close_connection_sync(Connection).
-
-%% Asserts via `meck` that both batches land in one `assign_deferred`
-%% call, so a missed race fails the test instead of passing by accident.
-modified_quorum_queue_deferral_token_at_limit_across_stashed_flows(Config) ->
-    QName = atom_to_binary(?FUNCTION_NAME),
-    {_, Session, LinkPair} = Init = init(Config),
-    {ok, #{type := <<"quorum">>}} = rabbitmq_amqp_client:declare_queue(
-                                      LinkPair, QName,
-                                      #{arguments => #{<<"x-queue-type">> => {utf8, <<"quorum">>}}}),
-    Address = rabbitmq_amqp_address:queue(QName),
-    {ok, Receiver} = amqp10_client:attach_receiver_link(
-                       Session, <<"receiver">>, Address, unsettled),
-    OutputHandle = element(4, Receiver),
-    Tokens1 = [{utf8, integer_to_binary(N)} || N <- lists:seq(1, 200)],
-    Tokens2 = [{utf8, integer_to_binary(N)} || N <- lists:seq(201, 256)],
-
-    Mod = rabbit_queue_type,
-    rabbit_ct_broker_helpers:setup_meck(Config),
-    ok = rpc(Config, meck, new, [Mod, [no_link, passthrough]]),
+    %% Suspending the queue keeps the 1st `FLOW`'s credit request in flight,
+    %% so the 2nd and 3rd `FLOW` (300 tokens combined) are always stashed.
+    RaName = ra_name(QName),
+    ok = rpc(Config, sys, suspend, [RaName]),
     try
         ok = amqp10_client_session:flow_link(
                Session, OutputHandle,
@@ -1288,14 +1304,82 @@ modified_quorum_queue_deferral_token_at_limit_across_stashed_flows(Config) ->
                   properties = {map, [{{symbol, <<"rabbitmq:deferral-tokens">>},
                                        {array, utf8, Tokens2}}]}},
                never),
+        receive
+            {amqp10_event,
+             {session, Session,
+              {ended, #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INVALID_FIELD}}}} -> ok
+        after 30000 -> flush(missing_ended),
+                       ct:fail("did not receive expected error")
+        end
+    after
+        ok = rpc(Config, sys, resume, [RaName])
+    end,
+    ok = close_connection_sync(Connection).
+
+%% Asserts via `meck` that both batches land in one
+%% `rabbit_queue_type:assign_deferred/4` call.
+modified_quorum_queue_deferral_token_at_limit_across_stashed_flows(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    {_, Session, LinkPair} = Init = init(Config),
+    {ok, #{type := <<"quorum">>}} = rabbitmq_amqp_client:declare_queue(
+                                      LinkPair, QName,
+                                      #{arguments => #{<<"x-queue-type">> => {utf8, <<"quorum">>}}}),
+    Address = rabbitmq_amqp_address:queue(QName),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"receiver">>, Address, unsettled),
+    OutputHandle = element(4, Receiver),
+    receive {amqp10_event, {link, Receiver, attached}} -> ok
+    after 30000 -> ct:fail({missing_attached, ?LINE})
+    end,
+    Tokens1 = [{utf8, integer_to_binary(N)} || N <- lists:seq(1, 200)],
+    Tokens2 = [{utf8, integer_to_binary(N)} || N <- lists:seq(201, 256)],
+
+    Mod = rabbit_queue_type,
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    ok = rpc(Config, meck, new, [Mod, [no_link, passthrough]]),
+    RaName = ra_name(QName),
+    try
+        %% Keep the 1st `FLOW`'s credit request in flight.
+        ok = rpc(Config, sys, suspend, [RaName]),
+        try
+            ok = amqp10_client_session:flow_link(
+                   Session, OutputHandle,
+                   #'v1_0.flow'{link_credit = {uint, 1}},
+                   never),
+            ok = amqp10_client_session:flow_link(
+                   Session, OutputHandle,
+                   #'v1_0.flow'{
+                      link_credit = {uint, 1},
+                      properties = {map, [{{symbol, <<"rabbitmq:deferral-tokens">>},
+                                           {array, utf8, Tokens1}}]}},
+                   never),
+            ok = amqp10_client_session:flow_link(
+                   Session, OutputHandle,
+                   #'v1_0.flow'{
+                      link_credit = {uint, 1},
+                      properties = {map, [{{symbol, <<"rabbitmq:deferral-tokens">>},
+                                           {array, utf8, Tokens2}}]}},
+                   never),
+            %% The session processes frames in order, so once this attach
+            %% completes, the `FLOW` frames above have been stashed.
+            {ok, Sender} = amqp10_client:attach_sender_link(
+                             Session, <<"sender">>,
+                             rabbitmq_amqp_address:exchange(<<"amq.fanout">>)),
+            receive {amqp10_event, {link, Sender, attached}} -> ok
+            after 30000 -> ct:fail({missing_attached, ?LINE})
+            end,
+            ok = detach_link_sync(Sender)
+        after
+            ok = rpc(Config, sys, resume, [RaName])
+        end,
+
+        ?awaitMatch([256], [length(Tokens) || Tokens <- assign_deferred_calls(Config, Mod)],
+                    30_000),
         %% None of these tokens have anything parked under them, so this must not error or deliver.
         receive {amqp10_msg, Receiver, _} -> ct:fail(unexpected_message)
         after 500 -> ok
         end,
-
-        History = rpc(Config, meck, history, [Mod]),
-        AssignDeferredCalls = [Tokens || {_Pid, {_Mod, assign_deferred, [_, _, Tokens, _]}, _Result} <- History],
-        ?assertEqual([256], [length(Tokens) || Tokens <- AssignDeferredCalls]),
+        ?assertEqual([256], [length(Tokens) || Tokens <- assign_deferred_calls(Config, Mod)]),
         ?assert(rpc(Config, meck, validate, [Mod]))
     after
         ok = rpc(Config, meck, unload, [Mod])
@@ -2661,9 +2745,11 @@ amqp091_to_amqp10_header_conversion(Session, Ch, QName, Address) ->
                       {<<"x-string">>, longstr, "my-string"},
                       {<<"x-int">>, long, 92},
                       {<<"x-bool">>, bool, true},
+                      {<<"x-table">>, table, [{<<"decimal">>, decimal, {2, 12345}}]},
                       {<<"string">>, longstr, "my-str"},
                       {<<"int">>, long, 101},
-                      {<<"bool">>, bool, false}],
+                      {<<"bool">>, bool, false},
+                      {<<"decimal">>, decimal, {2, 12345}}],
 
     amqp_channel:cast(
       Ch,
@@ -2683,11 +2769,13 @@ amqp091_to_amqp10_header_conversion(Session, Ch, QName, Address) ->
     ?assertEqual(<<"my-string">>, maps:get(<<"x-string">>, Amqp10MA, undefined)),
     ?assertEqual(92, maps:get(<<"x-int">>, Amqp10MA, undefined)),
     ?assertEqual(true, maps:get(<<"x-bool">>, Amqp10MA, undefined)),
+    ?assertEqual([], maps:get(<<"x-table">>, Amqp10MA, undefined)),
 
     Amqp10Props = amqp10_msg:application_properties(Msg),
     ?assertEqual(<<"my-str">>, maps:get(<<"string">>, Amqp10Props, undefined)),
     ?assertEqual(101, maps:get(<<"int">>, Amqp10Props, undefined)),
-    ?assertEqual(false, maps:get(<<"bool">>, Amqp10Props, undefined)).
+    ?assertEqual(false, maps:get(<<"bool">>, Amqp10Props, undefined)),
+    ?assertNot(maps:is_key(<<"decimal">>, Amqp10Props)).
 
 %% Test sending and receiving concurrently on multiple sessions of the same connection.
 multiple_sessions(Config) ->
@@ -4767,6 +4855,46 @@ max_message_size_server_to_client(Config) ->
     #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
     ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch).
 
+multi_transfer_empty_fragments(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config),
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName, durable = true}),
+    Sock = raw_attach_sender(Config, rabbitmq_amqp_address:queue(QName)),
+    First = raw_frame(#'v1_0.transfer'{handle = {uint, 0},
+                                       delivery_id = {uint, 0},
+                                       delivery_tag = {binary, <<"t1">>},
+                                       settled = false,
+                                       more = true},
+                      amqp10_framing:encode_bin(#'v1_0.data'{content = <<"hello">>})),
+    Empty = raw_frame(#'v1_0.transfer'{handle = {uint, 0}, more = true}),
+    Last = raw_frame(#'v1_0.transfer'{handle = {uint, 0}, more = false}),
+    ok = gen_tcp:send(Sock, [First, lists:duplicate(500_000, Empty), Last]),
+    ?assertMatch(#'v1_0.disposition'{state = #'v1_0.accepted'{}},
+                 raw_recv_until(Sock, 'v1_0.disposition')),
+    ?assertMatch({#'basic.get_ok'{}, #amqp_msg{payload = <<"hello">>}},
+                 amqp_channel:call(Ch, #'basic.get'{queue = QName, no_ack = true})),
+    ok = gen_tcp:close(Sock),
+    #'queue.delete_ok'{} = amqp_channel:call(Ch, #'queue.delete'{queue = QName}),
+    ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch).
+
+multi_transfer_max_message_size_exceeded(Config) ->
+    DefaultMaxMessageSize = rpc(Config, persistent_term, get, [max_message_size]),
+    ok = rpc(Config, persistent_term, put, [max_message_size, 2000]),
+    Sock = raw_attach_sender(Config, rabbitmq_amqp_address:exchange(<<"amq.fanout">>)),
+    ok = rpc(Config, persistent_term, put, [max_message_size, DefaultMaxMessageSize]),
+    First = #'v1_0.transfer'{handle = {uint, 0},
+                             delivery_id = {uint, 0},
+                             delivery_tag = {binary, <<"t1">>},
+                             more = true},
+    Continuation = #'v1_0.transfer'{handle = {uint, 0}, more = true},
+    ok = gen_tcp:send(Sock, [raw_frame(First, binary:copy(<<0>>, 1000)),
+                             raw_frame(Continuation, binary:copy(<<0>>, 1000)),
+                             raw_frame(Continuation, <<0>>)]),
+    ?assertMatch(#'v1_0.end'{error = #'v1_0.error'{
+                                        condition = ?V_1_0_LINK_ERROR_MESSAGE_SIZE_EXCEEDED}},
+                 raw_recv_until(Sock, 'v1_0.end')),
+    ok = gen_tcp:close(Sock).
+
 last_queue_confirms(Config) ->
     ClassicQ = <<"my classic queue">>,
     QuorumQ = <<"my quorum queue">>,
@@ -6168,6 +6296,40 @@ sections_out_of_order(Config) ->
                  rabbitmq_amqp_client:delete_queue(LinkPair, QName)),
     ok = rabbitmq_amqp_client:detach_management_link_pair_sync(LinkPair),
 
+    ok = end_session_sync(Session),
+    ok = close_connection_sync(Connection).
+
+message_section_too_large(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    Address = rabbitmq_amqp_address:queue(QName),
+    OpnConf = connection_config(Config),
+    {ok, Connection} = amqp10_client:open_connection(OpnConf),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, LinkPair} = rabbitmq_amqp_client:attach_management_link_pair_sync(
+                       Session, <<"management link pair">>),
+    {ok, _} = rabbitmq_amqp_client:declare_queue(LinkPair, QName, #{}),
+
+    Encode = fun(Section) -> iolist_to_binary(amqp10_framing:encode_bin(Section)) end,
+    AppProperties = Encode(#'v1_0.application_properties'{
+                              content = [{{utf8, <<"k">>},
+                                          {utf8, binary:copy(<<"v">>, 131_072)}}]}),
+    Data = Encode(#'v1_0.data'{content = <<"m1">>}),
+    {ok, Sender} = amqp10_client:attach_sender_link(
+                     Session, <<"sender">>, Address, settled),
+    ok = wait_for_credit(Sender),
+    ok = amqp10_client:send_msg(
+           Sender, amqp10_raw_msg:new(true, 0, <<AppProperties/binary, Data/binary>>)),
+    receive
+        {amqp10_event,
+         {link, Sender, {detached, #'v1_0.error'{condition = Cond}}}} ->
+            ?assertEqual(?V_1_0_AMQP_ERROR_DECODE_ERROR, Cond)
+    after 9000 -> flush(missing_detached),
+                  ct:fail("expected the link to be detached")
+    end,
+
+    ?assertMatch({ok, #{message_count := 0}},
+                 rabbitmq_amqp_client:delete_queue(LinkPair, QName)),
+    ok = rabbitmq_amqp_client:detach_management_link_pair_sync(LinkPair),
     ok = end_session_sync(Session),
     ok = close_connection_sync(Connection).
 
@@ -8101,6 +8263,54 @@ x_cc_annotation_queue(Config) ->
     ok = end_session_sync(Session),
     ok = close_connection_sync(Connection).
 
+non_utf8_names(Config) ->
+    {Connection, Session, LinkPair} = init(Config),
+    {ok, QResp} = management_request(
+                    LinkPair,
+                    #{subject => <<"PUT">>, to => <<"/queues/%FF">>},
+                    {map, []}),
+    ?assertMatch(#{subject := <<"400">>}, amqp10_msg:properties(QResp)),
+    {ok, XResp} = management_request(
+                    LinkPair,
+                    #{subject => <<"PUT">>, to => <<"/exchanges/%FF">>},
+                    {map, [{{utf8, <<"type">>}, {utf8, <<"direct">>}}]}),
+    ?assertMatch(#{subject := <<"400">>}, amqp10_msg:properties(XResp)),
+    ?assertEqual([], rpc(Config, rabbit_amqqueue, list, [])),
+
+    ValidName = <<"é"/utf8>>,
+    {ok, _} = rabbitmq_amqp_client:declare_queue(LinkPair, ValidName, #{}),
+    ok = rabbitmq_amqp_client:declare_exchange(LinkPair, ValidName, #{}),
+    ok = rabbitmq_amqp_client:delete_exchange(LinkPair, ValidName),
+    {ok, _} = rabbitmq_amqp_client:delete_queue(LinkPair, ValidName),
+
+    %% A queue that already exists with an invalid name can still be deleted.
+    QName = rabbit_misc:r(<<"/">>, queue, <<255>>),
+    {new, _} = rpc(Config, rabbit_amqqueue, declare,
+                   [QName, true, false, [], none, <<"acting-user">>]),
+    {ok, DResp} = management_request(
+                    LinkPair,
+                    #{subject => <<"DELETE">>, to => <<"/queues/%FF">>},
+                    null),
+    ?assertMatch(#{subject := <<"200">>}, amqp10_msg:properties(DResp)),
+    ?assertEqual([], rpc(Config, rabbit_amqqueue, list, [])),
+
+    ok = close({Connection, Session, LinkPair}).
+
+management_request(#link_pair{outgoing_link = OutgoingLink,
+                              incoming_link = IncomingLink},
+                   Props, Body) ->
+    MessageId = rand:bytes(8),
+    Request0 = amqp10_msg:new(<<>>, #'v1_0.amqp_value'{content = Body}, true),
+    Request = amqp10_msg:set_properties(
+                Props#{message_id => {binary, MessageId},
+                       reply_to => <<"$me">>}, Request0),
+    ok = amqp10_client:flow_link_credit(IncomingLink, 1, never),
+    ok = amqp10_client:send_msg(OutgoingLink, Request),
+    receive {amqp10_msg, IncomingLink, Response} ->
+                {ok, Response}
+    after 9000 -> ct:fail({missing_response, ?LINE})
+    end.
+
 %% Test that x-cc routing keys work together with target address 'null'
 x_cc_annotation_null(Config) ->
     QName1 = <<"queue 1">>,
@@ -8697,6 +8907,10 @@ ready_messages(QName, Config)
 ra_name(Q) ->
     binary_to_atom(<<"%2F_", Q/binary>>).
 
+assign_deferred_calls(Config, Mod) ->
+    [Tokens || {_Pid, {_Mod, assign_deferred, [_, _, Tokens, _]}, _Result}
+               <- rpc(Config, meck, history, [Mod])].
+
 wait_for_local_member(<<"stream">>, QName, Config) ->
     %% If it is a stream we need to wait until there is a local member
     %% on the node we want to subscribe from before proceeding.
@@ -8734,3 +8948,58 @@ assert_active_notification(LinkRef, Active, <<"quorum">>, Line) ->
 assert_active_notification(_, _, <<"classic">>, _) ->
     %% Classic queues do currently not support this notification.
     ok.
+
+%% A sender link on a plain socket, for frames that `amqp10_client` does not send.
+raw_attach_sender(Config, Address) ->
+    Port = get_node_config(Config, 0, tcp_port_amqp),
+    {ok, Sock} = gen_tcp:connect("localhost", Port, [binary, {active, false}]),
+    ok = gen_tcp:send(Sock, <<"AMQP", 3, 1, 0, 0>>),
+    {ok, <<"AMQP", 3, 1, 0, 0>>} = gen_tcp:recv(Sock, 8, 30_000),
+    #'v1_0.sasl_mechanisms'{} = raw_recv(Sock),
+    SaslInit = #'v1_0.sasl_init'{mechanism = {symbol, <<"PLAIN">>},
+                                 initial_response = {binary, <<0, "guest", 0, "guest">>}},
+    ok = gen_tcp:send(Sock, amqp10_binary_generator:build_frame(
+                              0, 1, amqp10_framing:encode_bin(SaslInit))),
+    #'v1_0.sasl_outcome'{code = ?V_1_0_SASL_CODE_OK} = raw_recv(Sock),
+    ok = gen_tcp:send(Sock, <<"AMQP", 0, 1, 0, 0>>),
+    {ok, <<"AMQP", 0, 1, 0, 0>>} = gen_tcp:recv(Sock, 8, 30_000),
+    ok = gen_tcp:send(Sock, raw_frame(#'v1_0.open'{container_id = {utf8, <<"raw">>}})),
+    #'v1_0.open'{} = raw_recv(Sock),
+    ok = gen_tcp:send(Sock, raw_frame(#'v1_0.begin'{next_outgoing_id = {uint, 0},
+                                                    incoming_window = {uint, 1000},
+                                                    outgoing_window = {uint, 1000}})),
+    #'v1_0.begin'{} = raw_recv(Sock),
+    ok = gen_tcp:send(Sock, raw_frame(#'v1_0.attach'{name = {utf8, <<"sender">>},
+                                                     handle = {uint, 0},
+                                                     role = false,
+                                                     source = #'v1_0.source'{},
+                                                     target = #'v1_0.target'{
+                                                                 address = {utf8, Address}},
+                                                     initial_delivery_count = {uint, 0}})),
+    #'v1_0.attach'{} = raw_recv(Sock),
+    Sock.
+
+raw_frame(Performative) ->
+    raw_frame(Performative, <<>>).
+
+raw_frame(Performative, Payload) ->
+    amqp10_binary_generator:build_frame(0, [amqp10_framing:encode_bin(Performative), Payload]).
+
+raw_recv_until(Sock, RecordName) ->
+    raw_recv_until(Sock, RecordName, erlang:monotonic_time(millisecond) + 30_000).
+
+raw_recv_until(Sock, RecordName, Deadline) ->
+    Performative = raw_recv(Sock, max(0, Deadline - erlang:monotonic_time(millisecond))),
+    case element(1, Performative) of
+        RecordName -> Performative;
+        _ -> raw_recv_until(Sock, RecordName, Deadline)
+    end.
+
+raw_recv(Sock) ->
+    raw_recv(Sock, 30_000).
+
+raw_recv(Sock, Timeout) ->
+    {ok, <<Size:32, DOff:8, _Type:8, _Channel:16>>} = gen_tcp:recv(Sock, 8, Timeout),
+    {ok, <<_:(DOff * 4 - 8)/binary, Body/binary>>} = gen_tcp:recv(Sock, Size - 8, Timeout),
+    [Performative | _] = amqp10_framing:decode_bin(Body),
+    Performative.

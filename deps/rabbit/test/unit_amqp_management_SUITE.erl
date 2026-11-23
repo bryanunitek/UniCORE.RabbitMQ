@@ -47,7 +47,12 @@ all() ->
      get_bindings_missing_destination_error_message_bounded,
      parse_uri_normalize_error_message_bounded,
      parse_uri_dissect_query_error_message_bounded,
-     decode_binding_path_segment_error_message_bounded
+     decode_binding_path_segment_error_message_bounded,
+     put_exchange_unknown_type_error,
+     require_utf8_rejects_invalid,
+     require_utf8_accepts_valid,
+     put_exchange_non_utf8_name_rejected,
+     access_refused_error_description
     ].
 
 init_per_testcase(_Testcase, Config) ->
@@ -301,6 +306,67 @@ decode_binding_path_segment_error_message_bounded(_Config) ->
     catch throw:{rabbit_amqp_management, <<"400">>, Reason} ->
               ?assert(byte_size(Reason) < 1000)
     end.
+
+put_exchange_unknown_type_error(_Config) ->
+    Expl = "unknown exchange type 'x~p'",
+    ok = meck:expect(rabbit_exchange, check_type,
+                     fun(_) ->
+                             exit(#amqp_error{name = precondition_failed,
+                                              explanation = Expl})
+                     end),
+    ReqPayload = {map, [{{utf8, <<"type">>}, {utf8, <<"x~p">>}}]},
+    try
+        rabbit_amqp_management:handle_http_req(
+          <<"PUT">>, [<<"exchanges">>, <<"x">>], #{}, ReqPayload,
+          ?VHOST, user(), self(), {[], []}),
+        ?assert(false)
+    catch throw:{rabbit_amqp_management, <<"400">>, Reason} ->
+              ?assertEqual(unicode:characters_to_binary(Expl), Reason)
+    end.
+
+require_utf8_rejects_invalid(_Config) ->
+    lists:foreach(
+      fun(Name) ->
+              ?assertThrow({rabbit_amqp_management, <<"400">>,
+                            <<"Bad name: not valid UTF-8">>},
+                           rabbit_amqp_management:require_utf8(Name))
+      end, [<<255>>, <<"a", 16#C3>>, <<16#C0, 16#AF>>]).
+
+require_utf8_accepts_valid(_Config) ->
+    lists:foreach(
+      fun(Name) ->
+              ?assertEqual(ok, rabbit_amqp_management:require_utf8(Name))
+      end, [<<>>, <<"q">>, <<"é"/utf8>>, <<"🗝️"/utf8>>]).
+
+put_exchange_non_utf8_name_rejected(_Config) ->
+    XName = rabbit_misc:r(?VHOST, exchange, <<255>>),
+    ok = mock_permitted([{XName, configure}]),
+    ok = meck:expect(rabbit_exchange, check_type, fun(T) -> binary_to_atom(T) end),
+    ReqPayload = {map, [{{utf8, <<"type">>}, {utf8, <<"direct">>}}]},
+    try
+        rabbit_amqp_management:handle_http_req(
+          <<"PUT">>, [<<"exchanges">>, <<"%FF">>], #{}, ReqPayload,
+          ?VHOST, user(), self(), {[], []}),
+        ?assert(false)
+    catch throw:{rabbit_amqp_management, <<"400">>, Reason} ->
+              ?assertEqual(<<"Bad name: not valid UTF-8">>, Reason)
+    end.
+
+access_refused_error_description(_Config) ->
+    Expl = "configure access to queue 'x~p' in vhost 'test vhost' "
+           "refused for user 'test user'",
+    ok = meck:expect(rabbit_access_control, check_resource_access,
+                     fun(_, _, _, _) ->
+                             exit(#amqp_error{name = access_refused,
+                                              explanation = Expl})
+                     end),
+    QName = rabbit_misc:r(?VHOST, queue, <<"x~p">>),
+    ?assertExit(
+       #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS,
+                     description = {utf8, Desc}}
+         when Desc =:= <<"configure access to queue 'x~p' in vhost "
+                         "'test vhost' refused for user 'test user'">>,
+       rabbit_amqp_session:check_resource_access(QName, configure, user(), [])).
 
 %%%===================================================================
 %%% Property

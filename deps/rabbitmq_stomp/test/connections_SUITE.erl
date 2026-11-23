@@ -26,13 +26,20 @@ all() ->
         login_timeout,
         credential_expires,
         authenticated_username_used_after_login,
+        incomplete_credentials_refused,
         frame_size,
         frame_size_huge,
         unauthenticated_frame_size_limited,
         unauthenticated_send_returns_error,
         unauthenticated_subscribe_returns_error,
         unauthenticated_disconnect_returns_error,
-        unauthenticated_error_does_not_crash_reader
+        unauthenticated_error_does_not_crash_reader,
+        connection_is_tracked,
+        reader_process_flags,
+        user_deletion_closes_connection,
+        vhost_connection_limit,
+        user_connection_limit,
+        connection_churn
     ].
 
 merge_app_env(Config) ->
@@ -279,6 +286,55 @@ authenticated_username_used_after_login0(Config) ->
         _ = Rpc(rabbit_auth_backend_internal, delete_user, [Username, <<"acting-user">>])
     end.
 
+incomplete_credentials_refused(Config) ->
+    case rabbit_ct_helpers:is_mixed_versions() of
+        false ->
+            incomplete_credentials_refused0(Config);
+        true ->
+            {skip, "Should not run in mixed version environments"}
+    end.
+
+incomplete_credentials_refused0(Config) ->
+    Rpc = fun(M, F, A) -> rabbit_ct_broker_helpers:rpc(Config, 0, M, F, A) end,
+    {ok, DefaultUser} = Rpc(application, get_env, [rabbitmq_stomp, default_user]),
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    try
+        ok = restart_with_default_user(Config, []),
+        ok = Rpc(meck, new, [rabbit_auth_backend_internal, [no_link, passthrough]]),
+        ok = Rpc(meck, expect, [rabbit_auth_backend_internal, user_login_authentication, 2,
+                                {ok, #auth_user{username = <<"guest">>, tags = [], impl = none}}]),
+        ?assertEqual('CONNECTED',
+                     raw_connect(Config, <<"login:guest\npasscode:guest\n">>)),
+        ?assertEqual(1, Rpc(meck, num_calls, [rabbit_auth_backend_internal,
+                                              user_login_authentication, '_'])),
+        [?assertEqual({'ERROR', {ok, <<"Bad CONNECT">>}}, raw_connect(Config, Headers))
+         || Headers <- [<<"login:guest\n">>, <<"passcode:guest\n">>, <<>>]],
+        ?assertEqual(1, Rpc(meck, num_calls, [rabbit_auth_backend_internal,
+                                              user_login_authentication, '_']))
+    after
+        _ = Rpc(meck, unload, [rabbit_auth_backend_internal]),
+        ok = restart_with_default_user(Config, DefaultUser)
+    end.
+
+restart_with_default_user(Config, DefaultUser) ->
+    Rpc = fun(M, F, A) -> rabbit_ct_broker_helpers:rpc(Config, 0, M, F, A) end,
+    ok = Rpc(application, stop, [rabbitmq_stomp]),
+    ok = Rpc(application, set_env, [rabbitmq_stomp, default_user, DefaultUser]),
+    ok = Rpc(application, start, [rabbitmq_stomp]).
+
+raw_connect(Config, Headers) ->
+    {ok, Sock} = gen_tcp:connect(localhost, get_stomp_port(Config), [{active, false}, binary]),
+    ok = gen_tcp:send(Sock, [<<"CONNECT\naccept-version:1.2\n">>, Headers, <<"\n\0">>]),
+    {ok, Data} = gen_tcp:recv(Sock, 0, 5000),
+    ok = gen_tcp:close(Sock),
+    {ok, Frame, _} = rabbit_stomp_frame:parse(Data, rabbit_stomp_frame:initial_state()),
+    case Frame of
+        #stomp_frame{command = 'ERROR'} ->
+            {'ERROR', rabbit_stomp_frame:header(Frame, <<"message">>)};
+        #stomp_frame{command = Command} ->
+            Command
+    end.
+
 frame_size(Config) ->
     rabbit_ct_broker_helpers:rpc(
       Config, 0,
@@ -363,3 +419,107 @@ unauthenticated_error_does_not_crash_reader(Config) ->
     gen_tcp:close(Sock),
     ?awaitMatch(N, count_connections(Config), 5_000),
     ok.
+
+connection_is_tracked(Config) ->
+    {ok, Client} = rabbit_stomp_client:connect(get_stomp_port(Config)),
+    ?awaitMatch(1, count_tracked_stomp_connections(Config), 30_000),
+    ?assertEqual(1, rabbit_ct_broker_helpers:rpc(
+                      Config, 0, rabbit_connection_tracking,
+                      count_tracked_items_in, [{user, <<"guest">>}])),
+    rabbit_stomp_client:disconnect(Client),
+    ?awaitMatch(0, count_tracked_stomp_connections(Config), 30_000).
+
+reader_process_flags(Config) ->
+    {ok, Client} = rabbit_stomp_client:connect(get_stomp_port(Config)),
+    [Reader] = rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_stomp, list, []),
+    ?assertMatch({max_heap_size, #{size := 0}},
+                 rabbit_ct_broker_helpers:rpc(Config, 0, erlang, process_info,
+                                              [Reader, max_heap_size])),
+    rabbit_stomp_client:disconnect(Client).
+
+user_deletion_closes_connection(Config) ->
+    User = <<"stomp-tracked-user">>,
+    ok = rabbit_ct_broker_helpers:add_user(Config, 0, User, User),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, User, <<"/">>),
+    {ok, {Sock, _}} = rabbit_stomp_client:connect("1.2", binary_to_list(User),
+                                                  binary_to_list(User),
+                                                  get_stomp_port(Config), []),
+    ?awaitMatch(1, count_tracked_stomp_connections(Config), 30_000),
+    ok = rabbit_ct_broker_helpers:delete_user(Config, User),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 30_000)),
+    ?awaitMatch(0, count_tracked_stomp_connections(Config), 30_000).
+
+vhost_connection_limit(Config) ->
+    ok = rabbit_ct_broker_helpers:set_vhost_limit(Config, 0, <<"/">>, max_connections, 1),
+    try
+        {ok, Client} = rabbit_stomp_client:connect(get_stomp_port(Config)),
+        ?awaitMatch(1, count_tracked_stomp_connections(Config), 30_000),
+        ?assertEqual(<<"Connection refused: vhost connection limit reached">>,
+                     connect_error(Config, "guest")),
+        rabbit_stomp_client:disconnect(Client)
+    after
+        ok = rabbit_ct_broker_helpers:clear_vhost_limit(Config, 0, <<"/">>)
+    end.
+
+user_connection_limit(Config) ->
+    ok = rabbit_ct_broker_helpers:set_user_limits(Config, <<"guest">>,
+                                                  #{max_connections => 1}),
+    try
+        {ok, Client} = rabbit_stomp_client:connect(get_stomp_port(Config)),
+        ?awaitMatch(1, count_tracked_stomp_connections(Config), 30_000),
+        ?assertEqual(<<"Connection refused: user connection limit reached">>,
+                     connect_error(Config, "guest")),
+        rabbit_stomp_client:disconnect(Client)
+    after
+        ok = rabbit_ct_broker_helpers:clear_user_limits(Config, <<"guest">>, all)
+    end.
+
+count_tracked_stomp_connections(Config) ->
+    length([C || #tracked_connection{protocol = {'STOMP', _}} = C
+                     <- rabbit_ct_broker_helpers:rpc(
+                          Config, 0, rabbit_connection_tracking, list, [])]).
+
+connect_error(Config, User) ->
+    {ok, Sock} = gen_tcp:connect(localhost, get_stomp_port(Config),
+                                 [{active, false}, binary]),
+    Client = {Sock, []},
+    rabbit_stomp_client:send(Client, 'CONNECT',
+                             [{<<"accept-version">>, <<"1.2">>},
+                              {<<"login">>, list_to_binary(User)},
+                              {<<"passcode">>, list_to_binary(User)}]),
+    {#stomp_frame{command = 'ERROR'} = Frame, _} = rabbit_stomp_client:recv(Client),
+    gen_tcp:close(Sock),
+    iolist_to_binary(lists:reverse(Frame#stomp_frame.body_iolist_rev)).
+
+connection_churn(Config) ->
+    User = atom_to_binary(?FUNCTION_NAME),
+    ok = rabbit_ct_broker_helpers:add_user(Config, User),
+    ok = rabbit_ct_broker_helpers:set_full_permissions(Config, User, <<"/">>),
+    Port = get_stomp_port(Config),
+    Open = churn_connect(Port, User),
+    Workers = [spawn_monitor(
+                 fun() ->
+                         [ok = gen_tcp:close(churn_connect(Port, User))
+                          || _ <- lists:seq(1, 50)]
+                 end) || _ <- lists:seq(1, 20)],
+    [receive {'DOWN', Ref, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+     end || {Pid, Ref} <- Workers],
+    Tracked = fun() ->
+                      {rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_connection_tracking,
+                                                    count_tracked_items_in, [{user, User}]),
+                       rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_connection_tracking,
+                                                    list_of_user, [User])}
+              end,
+    ?awaitMatch({1, [_]}, Tracked(), 30_000),
+    ok = gen_tcp:close(Open),
+    ?awaitMatch({0, []}, Tracked(), 30_000),
+    ok = rabbit_ct_broker_helpers:delete_user(Config, User).
+
+churn_connect(Port, User) ->
+    {ok, Sock} = gen_tcp:connect(localhost, Port, [{active, false}, binary]),
+    Client = {Sock, []},
+    rabbit_stomp_client:send(Client, 'CONNECT', [{<<"accept-version">>, <<"1.2">>},
+                                                 {<<"login">>, User},
+                                                 {<<"passcode">>, User}]),
+    {#stomp_frame{command = 'CONNECTED'}, _} = rabbit_stomp_client:recv(Client, 30_000),
+    Sock.

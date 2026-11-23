@@ -63,6 +63,7 @@
          handle_dest/2,
          ack/3,
          nack/2,
+         reject/2,
          forward/3,
          status/1,
          pending_count/1
@@ -84,7 +85,7 @@
 -import(rabbit_shovel_util, [pget2count/3,
                              obfuscated_uris/2,
                              deobfuscate_uris/1,
-                             validate_uri_fun/1]).
+                             validate_uri_fun/2]).
 
 -define(APP, rabbitmq_shovel).
 -define(QUEUE, lqueue).
@@ -235,7 +236,7 @@ validate_dest(Def) ->
 
 validate_src_funs(_Def, User) ->
     [
-     {<<"src-uri">>, validate_uri_fun(User), mandatory},
+     {<<"src-uri">>, validate_uri_fun(local, User), mandatory},
      {<<"src-exchange">>,     fun rabbit_parameter_validation:binary/2, optional},
      {<<"src-exchange-key">>, fun rabbit_parameter_validation:binary/2, optional},
      {<<"src-queue">>, fun rabbit_parameter_validation:binary/2, optional},
@@ -248,7 +249,7 @@ validate_src_funs(_Def, User) ->
     ].
 
 validate_dest_funs(_Def, User) ->
-    [{<<"dest-uri">>,        validate_uri_fun(User), mandatory},
+    [{<<"dest-uri">>,        validate_uri_fun(local, User), mandatory},
      {<<"dest-exchange">>,   fun rabbit_parameter_validation:binary/2,optional},
      {<<"dest-exchange-key">>,fun rabbit_parameter_validation:binary/2,optional},
      {<<"dest-queue">>,      fun rabbit_parameter_validation:amqp091_queue_name/2,optional},
@@ -565,6 +566,11 @@ nack(DeliveryTags,
                        end, {[], UAMQ0}, DeliveryTags),
     maybe_grant_credit(settle({modify, true, false, #{}}, MsgIds, UAMQ, State)).
 
+reject(DeliveryTag,
+       #{source := #{current := #{unacked_message_q := UAMQ0}}} = State) ->
+    {MsgIds, UAMQ} = collect_acks(UAMQ0, DeliveryTag, false),
+    maybe_grant_credit(settle(discard, MsgIds, UAMQ, State)).
+
 forward(Tag, Msg, State) ->
     case is_blocked(State) of
         true ->
@@ -873,23 +879,7 @@ check_resource_access(User = #user{username = Username}, Resource, Permission) -
 
 get_user_vhost_from_amqp_param(Uri) ->
     {ok, AmqpParam} = amqp_uri:parse(Uri),
-    {Username, Password, VHost} =
-        case AmqpParam of
-            #amqp_params_direct{username = U,
-                                password = P,
-                                virtual_host = V} ->
-                case {U, P} of
-                    {none, none} ->
-                        %% Default user for uris like amqp://
-                        {<<"guest">>, <<"guest">>, V};
-                    _ ->
-                        {U, P, V}
-                end;
-            #amqp_params_network{username = U,
-                                 password = P,
-                                 virtual_host = V} ->
-                {U, P, V}
-        end,
+    {Username, Password, VHost} = rabbit_shovel_util:local_credentials(AmqpParam),
     case rabbit_access_control:check_user_login(Username, [{password, Password}]) of
         {ok, User} ->
             try

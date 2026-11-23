@@ -42,6 +42,7 @@
 -define(MULTIACK_DESTINATION_A, <<"/amq/queue/TestMultiAckQueueA">>).
 -define(MULTIACK_DESTINATION_B, <<"/amq/queue/TestMultiAckQueueB">>).
 -define(BIND_FAIL_QUEUE, <<"TestSubscribeBindFailQueue">>).
+-define(AMQP_1_0_QUEUE, <<"TestAmqp10ConsumerQueue">>).
 -define(MAX_MSG_SIZE_QUEUE, <<"TestMaxMessageSizeQueue">>).
 -define(MAX_MSG_SIZE_DESTINATION, <<"/amq/queue/TestMaxMessageSizeQueue">>).
 
@@ -59,6 +60,8 @@ groups() ->
         declare_without_dlx,
         redeclare_existing_queue_with_restricted_dlx,
         subscribe_error,
+        subscribe_to_exclusive_queue_of_another_connection,
+        subscribe_to_own_exclusive_queue,
         reserved_queue_names_are_refused,
         queue_name_cr_lf_is_stripped,
         queue_name_of_only_cr_lf_is_refused,
@@ -86,6 +89,11 @@ groups() ->
         ack_auto_delivery_errors,
         reused_subscription_id_keeps_ack_mode,
         send,
+        send_with_expiration_limit,
+        send_with_invalid_expiration,
+        transaction_with_invalid_expiration,
+        send_with_negative_priority,
+        send_with_negative_priority_to_amqp_1_0_consumer,
         send_body_larger_than_max_message_size_is_rejected,
         delete_queue_subscribe,
         durable_resubscribe_pipelined_classic,
@@ -97,10 +105,13 @@ groups() ->
         blank_destination_in_send,
         stream_filtering,
         transaction_limit,
+        transaction_body_limit,
+        transaction_body_limit_is_released,
         commit_of_failed_transaction_has_no_receipt,
         send_unroutable_with_receipt,
         global_counters,
         global_counters_after_close,
+        delivery_counters,
         consumer_counter_after_server_cancel,
         stream_readers_closed_with_connection
     ],
@@ -177,7 +188,8 @@ init_per_testcase(TestCase, Config) ->
     end.
 
 tests_with_new_behavior() ->
-    [reserved_queue_names_are_refused,
+    [subscribe_to_exclusive_queue_of_another_connection,
+     reserved_queue_names_are_refused,
      queue_name_cr_lf_is_stripped,
      queue_name_of_only_cr_lf_is_refused,
      malformed_headers_are_refused,
@@ -188,6 +200,8 @@ tests_with_new_behavior() ->
      error_frame_with_utf8_encoded_text,
      stream_offset_is_refused_for_classic_queue,
      commit_of_failed_transaction_has_no_receipt,
+     transaction_body_limit,
+     transaction_body_limit_is_released,
      send_unroutable_with_receipt,
      global_counters_after_close,
      consumer_counter_after_server_cancel,
@@ -314,7 +328,8 @@ end_per_testcase0(_, Config) ->
 cleanup_per_testcase0(_, Config) ->
     _ = [delete_test_queue(Q, Config)
          || Q <- [?UNSUBSCRIBE_QUEUE, ?UNSUBSCRIBE_QUEUE_QQ, ?UNSUBSCRIBE_STREAM,
-                  ?MULTIACK_QUEUE_A, ?MULTIACK_QUEUE_B, ?BIND_FAIL_QUEUE]],
+                  ?MULTIACK_QUEUE_A, ?MULTIACK_QUEUE_B, ?BIND_FAIL_QUEUE,
+                  ?AMQP_1_0_QUEUE]],
     Config.
 
 delete_test_queue(Queue, Config) ->
@@ -351,6 +366,52 @@ transaction_limit(Config) ->
     {ok, _Client1, Hdrs, _} = stomp_receive(Client, 'ERROR'),
     <<"Transaction limit exceeded">> = maps:get(<<"message">>, Hdrs),
     ok.
+
+transaction_body_limit(Config) ->
+    Version = ?config(version, Config),
+    StompPort = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_stomp),
+    {ok, Client} = rabbit_stomp_client:connect(Version, StompPort),
+    Dest = {<<"destination">>, <<"/topic/transaction-body-limit">>},
+    Body = binary:copy(<<"x">>, 2 * 1024 * 1024),
+    Tx1 = [{<<"transaction">>, <<"tx1">>}],
+    Tx2 = [{<<"transaction">>, <<"tx2">>}],
+    rabbit_stomp_client:send(Client, 'BEGIN', Tx1),
+    rabbit_stomp_client:send(Client, 'BEGIN', Tx2),
+    [rabbit_stomp_client:send(Client, 'SEND', [Dest | Tx], [Body])
+     || Tx <- [Tx1, Tx2], _ <- lists:seq(1, 32)],
+    rabbit_stomp_client:send(Client, 'SEND', [Dest | Tx2], ["x"]),
+    {ok, {Sock, _}, Hdrs, _} = stomp_receive(Client, 'ERROR'),
+    ?assertEqual(<<"Transaction too large">>, maps:get(<<"message">>, Hdrs)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 30_000)).
+
+transaction_body_limit_is_released(Config) ->
+    Version = ?config(version, Config),
+    StompPort = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_stomp),
+    {ok, Client0} = rabbit_stomp_client:connect(Version, StompPort),
+    Dest = {<<"destination">>, <<"/topic/transaction-body-limit-released">>},
+    Body = binary:copy(<<"x">>, 2 * 1024 * 1024),
+    Tx = [{<<"transaction">>, <<"tx">>}],
+    FillTx = fun(Client) ->
+                     [rabbit_stomp_client:send(Client, 'SEND', [Dest | Tx], [Body])
+                      || _ <- lists:seq(1, 60)]
+             end,
+    rabbit_stomp_client:send(Client0, 'BEGIN', Tx),
+    FillTx(Client0),
+    rabbit_stomp_client:send(Client0, 'COMMIT', [{<<"receipt">>, <<"commit">>} | Tx]),
+    Client1 = stomp_receive_receipt(Client0, <<"commit">>),
+    rabbit_stomp_client:send(Client1, 'BEGIN', Tx),
+    FillTx(Client1),
+    rabbit_stomp_client:send(Client1, 'ABORT', [{<<"receipt">>, <<"abort">>} | Tx]),
+    Client2 = stomp_receive_receipt(Client1, <<"abort">>),
+    rabbit_stomp_client:send(Client2, 'BEGIN', Tx),
+    FillTx(Client2),
+    rabbit_stomp_client:send(Client2, 'BEGIN', Tx),
+    FillTx(Client2),
+    rabbit_stomp_client:send(Client2, 'SEND', [Dest, {<<"receipt">>, <<"send">>}], [Body]),
+    Client3 = stomp_receive_receipt(Client2, <<"send">>),
+    rabbit_stomp_client:send(Client3, 'COMMIT', [{<<"receipt">>, <<"commit2">>} | Tx]),
+    Client4 = stomp_receive_receipt(Client3, <<"commit2">>),
+    rabbit_stomp_client:disconnect(Client4).
 
 commit_of_failed_transaction_has_no_receipt(Config) ->
     Version = ?config(version, Config),
@@ -446,6 +507,59 @@ global_counters_after_close(Config) ->
     {ok, _, _, _} = stomp_receive(Client2, 'ERROR', 30_000),
     ?awaitMatch({0, 0}, Counters(), 30_000),
     rabbit_ct_helpers:consistently(?_assertEqual({0, 0}, Counters()), 200, 5).
+
+delivery_counters(Config) ->
+    Version = ?config(version, Config),
+    ProtoVer = stomp_proto_ver(Version),
+    Client = ?config(stomp_client, Config),
+    Topic = iolist_to_binary(["/topic/delivery-counters-", Version]),
+    Queue = iolist_to_binary(["/queue/delivery-counters-", Version]),
+    Counters = fun() ->
+                       maps:get(#{protocol => ProtoVer,
+                                  queue_type => rabbit_classic_queue},
+                                rabbit_ct_broker_helpers:rpc(
+                                  Config, 0, rabbit_global_counters, overview, []))
+               end,
+    #{messages_delivered_total := D0,
+      messages_delivered_consume_auto_ack_total := Auto0,
+      messages_delivered_consume_manual_ack_total := Manual0,
+      messages_acknowledged_total := Acked0} = Counters(),
+
+    rabbit_stomp_client:send(
+      Client, 'SUBSCRIBE', [{<<"destination">>, Topic}, {<<"id">>, <<"auto">>},
+                            {<<"receipt">>, <<"r1">>}]),
+    Client1 = stomp_receive_receipt(Client, <<"r1">>),
+    rabbit_stomp_client:send(Client1, 'SEND', [{<<"destination">>, Topic}], ["hello"]),
+    {ok, Client2, _, _} = stomp_receive(Client1, 'MESSAGE'),
+    D1 = D0 + 1,
+    Auto1 = Auto0 + 1,
+    ?awaitMatch(#{messages_delivered_total := D1,
+                  messages_delivered_consume_auto_ack_total := Auto1,
+                  messages_delivered_consume_manual_ack_total := Manual0,
+                  messages_acknowledged_total := Acked0},
+                Counters(), 30_000),
+
+    rabbit_stomp_client:send(
+      Client2, 'SUBSCRIBE', [{<<"destination">>, Queue}, {<<"id">>, <<"manual">>},
+                             {<<"ack">>, <<"client">>}, {<<"receipt">>, <<"r2">>}]),
+    Client3 = stomp_receive_receipt(Client2, <<"r2">>),
+    rabbit_stomp_client:send(Client3, 'SEND', [{<<"destination">>, Queue}], ["hello"]),
+    {ok, Client4, Hdrs, _} = stomp_receive(Client3, 'MESSAGE'),
+    D2 = D1 + 1,
+    Manual1 = Manual0 + 1,
+    ?awaitMatch(#{messages_delivered_total := D2,
+                  messages_delivered_consume_auto_ack_total := Auto1,
+                  messages_delivered_consume_manual_ack_total := Manual1,
+                  messages_acknowledged_total := Acked0},
+                Counters(), 30_000),
+
+    rabbit_stomp_client:send(
+      Client4, 'ACK', [{rabbit_stomp_util:ack_header_name(Version),
+                        maps:get(rabbit_stomp_util:msg_header_name(Version), Hdrs)},
+                       {<<"receipt">>, <<"r3">>}]),
+    stomp_receive_receipt(Client4, <<"r3">>),
+    Acked1 = Acked0 + 1,
+    ?assertMatch(#{messages_acknowledged_total := Acked1}, Counters()).
 
 consumer_counter_after_server_cancel(Config) ->
     ProtoVer = stomp_proto_ver(?config(version, Config)),
@@ -576,6 +690,32 @@ subscribe_error(Config) ->
       Client, 'SUBSCRIBE', [{<<"destination">>, ?DESTINATION}]),
     {ok, _Client1, Hdrs, _} = stomp_receive(Client, 'ERROR'),
     <<"not_found">> = maps:get(<<"message">>, Hdrs),
+    ok.
+
+subscribe_to_exclusive_queue_of_another_connection(Config) ->
+    Channel = ?config(amqp_channel, Config),
+    Client = ?config(stomp_client, Config),
+    #'queue.declare_ok'{queue = QName} =
+        amqp_channel:call(Channel, #'queue.declare'{exclusive = true}),
+    rabbit_stomp_client:send(
+      Client, 'SUBSCRIBE', [{<<"destination">>, <<"/amq/queue/", QName/binary>>},
+                            {<<"id">>, <<"s">>}]),
+    {ok, _Client1, Hdrs, _} = stomp_receive(Client, 'ERROR', 30_000),
+    ?assertEqual(<<"resource_locked">>, maps:get(<<"message">>, Hdrs)),
+    ok.
+
+subscribe_to_own_exclusive_queue(Config) ->
+    Client = ?config(stomp_client, Config),
+    Name = <<"own-exclusive-", (integer_to_binary(rand:uniform(1_000_000)))/binary>>,
+    rabbit_stomp_client:send(
+      Client, 'SUBSCRIBE', [{<<"destination">>, <<"/queue/", Name/binary>>},
+                            {<<"id">>, <<"s1">>}]),
+    rabbit_stomp_client:send(
+      Client, 'SUBSCRIBE', [{<<"destination">>, <<"/amq/queue/", Name/binary>>},
+                            {<<"id">>, <<"s2">>}]),
+    rabbit_stomp_client:send(
+      Client, 'SEND', [{<<"destination">>, <<"/queue/", Name/binary>>}], ["hello"]),
+    {ok, _Client1, _, [<<"hello">>]} = stomp_receive(Client, 'MESSAGE', 30_000),
     ok.
 
 reserved_queue_names_are_refused(Config) ->
@@ -1701,6 +1841,118 @@ send(Config) ->
 
     {ok, _Client2, _, [<<"hello">>]} = stomp_receive(Client1, 'MESSAGE'),
     ok.
+
+send_with_expiration_limit(Config) ->
+    Channel = ?config(amqp_channel, Config),
+    Client = ?config(stomp_client, Config),
+    #'queue.declare_ok'{queue = Queue} =
+        amqp_channel:call(Channel, #'queue.declare'{exclusive = true}),
+    rabbit_stomp_client:send(
+      Client, 'SEND', [{<<"destination">>, <<"/amq/queue/", Queue/binary>>},
+                       {<<"expiration">>, <<"315360000000">>},
+                       {<<"receipt">>, <<"expiry">>}], ["hello"]),
+    stomp_receive_receipt(Client, <<"expiry">>),
+    {#'basic.get_ok'{},
+     #amqp_msg{props = #'P_basic'{expiration = <<"315360000000">>}, payload = <<"hello">>}} =
+        amqp_channel:call(Channel, #'basic.get'{queue = Queue, no_ack = true}),
+    ok.
+
+send_with_invalid_expiration(Config) ->
+    send_with_invalid_expiration(Config, []).
+
+transaction_with_invalid_expiration(Config) ->
+    send_with_invalid_expiration(Config, [{<<"transaction">>, <<"expiry">>}]).
+
+send_with_invalid_expiration(Config, Transaction) ->
+    Channel = ?config(amqp_channel, Config),
+    Version = ?config(version, Config),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_stomp),
+    #'queue.declare_ok'{queue = Queue} =
+        amqp_channel:call(Channel, #'queue.declare'{exclusive = true}),
+    lists:foreach(
+      fun({Expiration, Reason}) ->
+              {ok, Client} = rabbit_stomp_client:connect(Version, Port),
+              case Transaction of
+                  [] -> ok;
+                  _ ->
+                      rabbit_stomp_client:send(Client, 'BEGIN', Transaction),
+                      rabbit_stomp_client:send(
+                        Client, 'SEND', [{<<"destination">>, <<"/amq/queue/", Queue/binary>>}
+                                         | Transaction], ["valid"])
+              end,
+              Before = queue_churn(Config),
+              rabbit_stomp_client:send(
+                Client, 'SEND', [{<<"destination">>, <<"/queue/invalid-expiration-queue">>},
+                                 {<<"reply-to">>, <<"/temp-queue/invalid-expiration-reply">>},
+                                 {<<"expiration">>, Expiration},
+                                 {<<"receipt">>, <<"send">>} | Transaction], ["hello"]),
+              {ok, {Sock, Buffered}, Headers, Body} = stomp_receive(Client, 'ERROR'),
+              ?assertEqual(<<"precondition_failed">>, maps:get(<<"message">>, Headers)),
+              Error = iolist_to_binary(lists:reverse(Body)),
+              ?assertNotEqual(nomatch, binary:match(
+                                        Error, <<"invalid expiration '", Expiration/binary, "': ">>)),
+              ?assertNotEqual(nomatch, binary:match(Error, Reason)),
+              ?assertEqual([], Buffered),
+              ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, 30_000)),
+              ?assertEqual({0, 0}, queue_churn_since(Before, Config)),
+              ?assertEqual(#'basic.get_empty'{},
+                           amqp_channel:call(Channel, #'basic.get'{queue = Queue, no_ack = true}))
+      end, [{<<"315360000001">>, <<"value_too_large">>},
+            {<<"-1">>, <<"value_negative">>},
+            {<<"abc">>, <<"no_integer">>},
+            {<<"10abc">>, <<"leftover_string">>},
+            {<<>>, <<"no_integer">>}]).
+
+send_with_negative_priority(Config) ->
+    Channel = ?config(amqp_channel, Config),
+    Client = ?config(stomp_client, Config),
+    #'queue.declare_ok'{} =
+        amqp_channel:call(Channel, #'queue.declare'{queue     = ?QUEUE,
+                                                    durable   = true,
+                                                    arguments = [{<<"x-max-priority">>, byte, 5}]}),
+    [rabbit_stomp_client:send(
+       Client, 'SEND', [{<<"destination">>, ?DESTINATION},
+                        {<<"priority">>, integer_to_binary(P)}], [integer_to_list(P)])
+     || P <- [-1, -1, -1, -1, -1, -1, -1, 2]],
+    rabbit_stomp_client:send(
+      Client, 'SUBSCRIBE', [{<<"destination">>, ?DESTINATION}, {<<"receipt">>, <<"foo">>}]),
+    {ok, Client1, _, _} = stomp_receive(Client, 'RECEIPT'),
+    {ok, Client2, _, [<<"2">>]} = stomp_receive(Client1, 'MESSAGE'),
+    lists:foldl(fun(_, C) ->
+                        {ok, C1, Hdrs, [<<"-1">>]} = stomp_receive(C, 'MESSAGE'),
+                        ?assertEqual(<<"0">>, maps:get(<<"priority">>, Hdrs)),
+                        C1
+                end, Client2, lists:seq(1, 7)),
+    #'queue.delete_ok'{} =
+        amqp_channel:call(Channel, #'queue.delete'{queue = ?QUEUE}),
+    ok.
+
+send_with_negative_priority_to_amqp_1_0_consumer(Config) ->
+    Channel = ?config(amqp_channel, Config),
+    Client = ?config(stomp_client, Config),
+    #'queue.declare_ok'{} =
+        amqp_channel:call(Channel, #'queue.declare'{queue = ?AMQP_1_0_QUEUE, durable = true}),
+    rabbit_stomp_client:send(
+      Client, 'SEND', [{<<"destination">>, <<"/amq/queue/", ?AMQP_1_0_QUEUE/binary>>},
+                       {<<"priority">>, <<"-1">>},
+                       {<<"receipt">>, <<"r">>}], ["hello"]),
+    {ok, _, _, _} = stomp_receive(Client, 'RECEIPT'),
+
+    {ok, _} = application:ensure_all_started(amqp10_client),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_amqp),
+    {ok, Connection} = amqp10_client:open_connection(
+                         #{address => ?config(rmq_hostname, Config),
+                           port => Port,
+                           container_id => atom_to_binary(?FUNCTION_NAME),
+                           sasl => {plain, <<"guest">>, <<"guest">>}}),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, Receiver} = amqp10_client:attach_receiver_link(
+                       Session, <<"receiver">>,
+                       <<"/queues/", ?AMQP_1_0_QUEUE/binary>>, settled),
+    {ok, Msg} = amqp10_client:get_msg(Receiver, 30_000),
+    ?assertEqual(<<"hello">>, amqp10_msg:body_bin(Msg)),
+    ?assertEqual(0, amqp10_msg:header(priority, Msg)),
+    ok = amqp10_client:close_connection(Connection).
 
 send_body_larger_than_max_message_size_is_rejected(Config) ->
     Channel = ?config(amqp_channel, Config),

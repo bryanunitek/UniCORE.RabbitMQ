@@ -111,6 +111,7 @@
          conserve_resources/3,
          check_resource_access/4,
          check_read_permitted_on_topic/4,
+         check_write_permitted_on_topics/4,
          reset_authz/2,
          info/1,
          connection_pid/1,
@@ -150,6 +151,7 @@
 %% incoming multi transfer delivery [2.6.14]
 -record(multi_transfer_msg, {
           payload_fragments_rev :: [binary(),...],
+          payload_size :: non_neg_integer(),
           delivery_id :: delivery_number(),
           settled :: boolean()
          }).
@@ -159,7 +161,13 @@
 -record(management_link_pair, {
           client_terminus_address,
           incoming_half :: unattached | link_handle(),
-          outgoing_half :: unattached | link_handle()
+          outgoing_half :: unattached | link_handle(),
+          %% Number of responses in `outgoing_pending`. Credit for further requests
+          %% is granted only once this is 0, which bounds the buffered responses.
+          pending_responses = 0 :: non_neg_integer(),
+          %% The drain field of a FLOW owed on the outgoing half. It is sent once
+          %% `pending_responses` is 0 so that it does not overtake responses.
+          flow_reply = none :: none | boolean()
          }).
 
 %% Incoming or outgoing half of the link pair.
@@ -278,6 +286,7 @@
          }).
 
 -record(pending_management_delivery, {
+          link_name :: binary(),
           %% A large message can be split into multiple transfer frames.
           frames :: [transfer_frame_body(), ...]
          }).
@@ -603,7 +612,7 @@ handle_cast({frame_body, FrameBody},
               Err = #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
                                   description = {utf8, <<"internal error">>}},
               log_error_and_close_session(
-                Err, rabbit_misc:format("~tp~n~tp", [Reason, Stacktrace]), State0)
+                Err, rabbit_misc:format("~tP~n~tP", [Reason, ?FORMAT_DEPTH_LIMIT, Stacktrace, ?FORMAT_DEPTH_LIMIT]), State0)
     end;
 handle_cast({queue_event, _, _} = QEvent, State0) ->
     try handle_queue_event(QEvent, State0) of
@@ -1139,8 +1148,8 @@ handle_frame(#'v1_0.flow'{handle = Handle} = Flow,
                                 %% "If set to a handle that is not currently associated with
                                 %% an attached link, the recipient MUST respond by ending the
                                 %% session with an unattached-handle session error." [2.7.4]
-                                ?LOG_WARNING("Received Flow frame for unknown link handle: ~tp",
-                                             [Flow]),
+                                ?LOG_WARNING("Received Flow frame for unknown link handle: ~tP",
+                                             [Flow, ?FORMAT_DEPTH_LIMIT]),
                                 protocol_error(
                                   ?V_1_0_SESSION_ERROR_UNATTACHED_HANDLE,
                                   "Unattached link handle: ~b", [HandleInt])
@@ -1342,8 +1351,8 @@ handle_frame(Detach0 = #'v1_0.detach'{handle = ?UINT(HandleInt),
                                 {error, Reason} ->
                                     protocol_error(
                                       ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                                      "Failed to remove consumer from ~s: ~tp",
-                                      [rabbit_misc:rs(amqqueue:get_name(Q)), Reason])
+                                      "Failed to remove consumer from ~s: ~tP",
+                                      [rabbit_misc:rs(amqqueue:get_name(Q)), Reason, ?FORMAT_DEPTH_LIMIT])
                             end;
                         {error, not_found} ->
                             {OutgoingLinks1, Unsettled1, Pending1, QStates0, Detach0, PC}
@@ -1382,14 +1391,16 @@ handle_frame(#'v1_0.end'{},
                       Reason =:= noproc ->
                    %% AMQP connection and therefore the writer process got already terminated
                    %% before we had the chance to synchronously end the session.
+                   ok;
+               exit:{{shutdown, _}, {gen_server, call, _ArgList}} ->
                    ok
          end,
     {stop, normal, State};
 
 handle_frame(Frame, _State) ->
     protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                   "Unexpected frame ~tp",
-                   [amqp10_framing:pprint(Frame)]).
+                   "Unexpected frame ~tP",
+                   [amqp10_framing:pprint(Frame), ?FORMAT_DEPTH_LIMIT]).
 
 reply_frames(Frames, State) ->
     {ok, session_flow_fields(Frames, State), State}.
@@ -1419,8 +1430,8 @@ handle_attach(#'v1_0.attach'{
                                 Pairs0);
                 #{LinkName := Other} ->
                     link_error(?V_1_0_AMQP_ERROR_PRECONDITION_FAILED,
-                               "received invalid attach ~p for management link pair ~p",
-                               [Attach, Other]);
+                               "received invalid attach ~P for management link pair ~P",
+                               [Attach, ?FORMAT_DEPTH_LIMIT, Other, ?FORMAT_DEPTH_LIMIT]);
                 _ ->
                     maps:put(LinkName,
                              #management_link_pair{client_terminus_address = ClientTerminusAddress,
@@ -1428,10 +1439,16 @@ handle_attach(#'v1_0.attach'{
                                                    outgoing_half = unattached},
                              Pairs0)
             end,
+    Credit = case maps:get(LinkName, Pairs) of
+                 #management_link_pair{pending_responses = 0} ->
+                     ?MAX_MANAGEMENT_LINK_CREDIT;
+                 #management_link_pair{} ->
+                     0
+             end,
     MaxMessageSize = persistent_term:get(max_message_size),
     Link = #management_link{name = LinkName,
                             delivery_count = DeliveryCountInt,
-                            credit = ?MAX_MANAGEMENT_LINK_CREDIT,
+                            credit = Credit,
                             max_message_size = MaxMessageSize},
     State = State0#state{management_link_pairs = Pairs,
                          incoming_management_links = maps:put(HandleInt, Link, Links)},
@@ -1448,7 +1465,7 @@ handle_attach(#'v1_0.attach'{
                properties = Properties},
     Flow = #'v1_0.flow'{handle = Handle,
                         delivery_count = DeliveryCount,
-                        link_credit = ?UINT(?MAX_MANAGEMENT_LINK_CREDIT)},
+                        link_credit = ?UINT(Credit)},
     reply_frames([Reply, Flow], State);
 
 handle_attach(#'v1_0.attach'{
@@ -1476,8 +1493,8 @@ handle_attach(#'v1_0.attach'{
                                 Pairs0);
                 #{LinkName := Other} ->
                     link_error(?V_1_0_AMQP_ERROR_PRECONDITION_FAILED,
-                               "received invalid attach ~p for management link pair ~p",
-                               [Attach, Other]);
+                               "received invalid attach ~P for management link pair ~P",
+                               [Attach, ?FORMAT_DEPTH_LIMIT, Other, ?FORMAT_DEPTH_LIMIT]);
                 _ ->
                     maps:put(LinkName,
                              #management_link_pair{client_terminus_address = ClientTerminusAddress,
@@ -1557,8 +1574,8 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_SENDER,
             reply_frames([Reply, Flow], State);
         {error, Reason} ->
             link_error(?V_1_0_AMQP_ERROR_INVALID_FIELD,
-                       "Attach refused: ~tp",
-                       [Reason])
+                       "Attach refused: ~tP",
+                       [Reason, ?FORMAT_DEPTH_LIMIT])
     end;
 
 handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
@@ -1591,9 +1608,9 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
     case ensure_source(Source0, SndSettled, LinkNameBin,
                        Cfg, PermCache0, TopicPermCache0) of
         {error, {amqp_error, Condition, Description}} ->
-            link_error(Condition, Description, []);
+            link_error(Condition, "~ts", [Description]);
         {error, Reason} ->
-            link_error(?V_1_0_AMQP_ERROR_INVALID_FIELD, "Attach refused: ~tp", [Reason]);
+            link_error(?V_1_0_AMQP_ERROR_INVALID_FIELD, "Attach refused: ~tP", [Reason, ?FORMAT_DEPTH_LIMIT]);
         {ok, #resource{name = QNameBin} = QName,
          #'v1_0.source'{address = {utf8, SourceAddress},
                         filter = DesiredFilter,
@@ -1704,8 +1721,8 @@ handle_attach(#'v1_0.attach'{role = ?AMQP_ROLE_RECEIVER,
                     reply_frames(Reply, State);
                 {error, Reason} ->
                     link_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                               "Could not operate on ~ts: ~tp",
-                               [rabbit_misc:rs(QName), Reason])
+                               "Could not operate on ~ts: ~tP",
+                               [rabbit_misc:rs(QName), Reason, ?FORMAT_DEPTH_LIMIT])
             end;
         {ok, jms_subscription_lookup, QName, QType,
          #'v1_0.source'{address = {utf8, SourceAddress},
@@ -2058,16 +2075,23 @@ send_pending_delivery(#pending_delivery{
             State = State0#state{outgoing_pending = Buf0},
             {Space, State}
     end;
-send_pending_delivery(#pending_management_delivery{frames = Frames} = Pending,
+send_pending_delivery(#pending_management_delivery{link_name = Name,
+                                                   frames = Frames} = Pending,
                       Buf0,
                       #state{remote_incoming_window = Space,
+                             management_link_pairs = Pairs,
                              cfg = #cfg{writer_pid = WriterPid,
                                         channel_num = Ch}
                             } = State0) ->
     SendFun = send_fun(WriterPid, Ch),
     case send_frames(SendFun, Frames, Space) of
         {sent_all, SpaceLeft} ->
-            State = State0#state{outgoing_pending = Buf0},
+            #management_link_pair{pending_responses = N} = Pair0 = maps:get(Name, Pairs),
+            Pair = Pair0#management_link_pair{pending_responses = N - 1},
+            State1 = State0#state{outgoing_pending = Buf0,
+                                  management_link_pairs = maps:update(Name, Pair, Pairs)},
+            State2 = maybe_grant_mgmt_link_credit(Pair, State1),
+            State = maybe_send_mgmt_flow_reply(Pair, State2),
             {SpaceLeft, State};
         {sent_some, SpaceLeft, Rest} ->
             Buf = queue:in_r(Pending#pending_management_delivery{frames = Rest}, Buf0),
@@ -2257,8 +2281,8 @@ settle_op_from_outcome(#'v1_0.modified'{delivery_failed = DelFailed,
                                 ({{symbol, <<"x-opt-deferral-token">>}, Other}) ->
                                      protocol_error(
                                        ?V_1_0_AMQP_ERROR_INVALID_FIELD,
-                                       "x-opt-deferral-token must be of AMQP type utf8, got: ~tp",
-                                       [Other]);
+                                       "x-opt-deferral-token must be of AMQP type utf8, got: ~tP",
+                                       [Other, ?FORMAT_DEPTH_LIMIT]);
                                 ({{symbol, <<"x-", _/binary>> = K}, V}) ->
                                      {K, unwrap_simple_type(V)}
                              end, KVList),
@@ -2271,8 +2295,8 @@ settle_op_from_outcome(#'v1_0.modified'{delivery_failed = DelFailed,
 settle_op_from_outcome(Outcome) ->
     protocol_error(
       ?V_1_0_AMQP_ERROR_INVALID_FIELD,
-      "Unrecognised state: ~tp in DISPOSITION",
-      [Outcome]).
+      "Unrecognised state: ~tP in DISPOSITION",
+      [Outcome, ?FORMAT_DEPTH_LIMIT]).
 
 -spec flow({uint, link_handle()}, sequence_no(), rabbit_queue_type:credit()) ->
     #'v1_0.flow'{}.
@@ -2459,7 +2483,7 @@ incoming_mgmt_link_transfer(
   #'v1_0.transfer'{
      settled = Settled,
      more = More,
-     handle = IncomingHandle = ?UINT(IncomingHandleInt)},
+     handle = ?UINT(IncomingHandleInt)},
   Request,
   #state{management_link_pairs = LinkPairs,
          incoming_management_links = IncomingLinks,
@@ -2502,8 +2526,9 @@ incoming_mgmt_link_transfer(
     end,
     #management_link_pair{
        incoming_half = IncomingHandleInt,
-       outgoing_half = OutgoingHandleInt
-      } = maps:get(Name, LinkPairs),
+       outgoing_half = OutgoingHandleInt,
+       pending_responses = PendingResponses
+      } = LinkPair0 = maps:get(Name, LinkPairs),
     OutgoingLink0 = case OutgoingHandleInt of
                         unattached ->
                             protocol_error(
@@ -2539,23 +2564,22 @@ incoming_mgmt_link_transfer(
                   more = false},
     validate_message_size(Response, OutgoingMaxMessageSize),
     Frames = transfer_frames(Transfer, Response, MaxFrameSize),
-    PendingDelivery = #pending_management_delivery{frames = Frames},
-    IncomingDeliveryCount = add(IncomingDeliveryCount0, 1),
-    IncomingCredit1 = IncomingCredit0 - 1,
-    {IncomingCredit, Reply} = maybe_grant_mgmt_link_credit(
-                                IncomingCredit1, IncomingDeliveryCount, IncomingHandle),
-    IncomingLink = IncomingLink0#management_link{delivery_count = IncomingDeliveryCount,
-                                                 credit = IncomingCredit},
+    PendingDelivery = #pending_management_delivery{link_name = Name,
+                                                   frames = Frames},
+    IncomingLink = IncomingLink0#management_link{delivery_count = add(IncomingDeliveryCount0, 1),
+                                                 credit = IncomingCredit0 - 1},
     OutgoingLink = OutgoingLink0#management_link{delivery_count = add(OutgoingDeliveryCount, 1),
                                                  credit = OutgoingCredit - 1},
+    LinkPair = LinkPair0#management_link_pair{pending_responses = PendingResponses + 1},
     State = State0#state{
               outgoing_delivery_id = add(OutgoingDeliveryId, 1),
               outgoing_pending = queue:in(PendingDelivery, Pending),
+              management_link_pairs = maps:update(Name, LinkPair, LinkPairs),
               incoming_management_links = maps:update(IncomingHandleInt, IncomingLink, IncomingLinks),
               outgoing_management_links = maps:update(OutgoingHandleInt, OutgoingLink, OutgoingLinks),
               permission_cache = PermCache,
               topic_permission_cache = TopicPermCache},
-    {Reply, State}.
+    {[], State}.
 
 incoming_link_transfer(
   #'v1_0.transfer'{more = true,
@@ -2569,6 +2593,7 @@ incoming_link_transfer(
     Link = Link0#incoming_link{
              multi_transfer_msg = #multi_transfer_msg{
                                      payload_fragments_rev = [MsgPart],
+                                     payload_size = byte_size(MsgPart),
                                      delivery_id = DeliveryId,
                                      %% "If not set on the first (or only) transfer for a (multi-transfer)
                                      %% delivery, then the settled flag MUST be interpreted as being false."
@@ -2583,15 +2608,22 @@ incoming_link_transfer(
              max_message_size = MaxMessageSize,
              multi_transfer_msg = Multi = #multi_transfer_msg{
                                              payload_fragments_rev = PFR0,
+                                             payload_size = PayloadSize0,
                                              delivery_id = FirstDeliveryId,
                                              settled = FirstSettled}},
   State) ->
     %% This is a continuation transfer with even more transfers to come.
     validate_multi_transfer_delivery_id(DeliveryId, FirstDeliveryId),
     validate_multi_transfer_settled(Settled, FirstSettled),
-    PFR = [MsgPart | PFR0],
-    validate_message_size(PFR, MaxMessageSize),
-    Link = Link0#incoming_link{multi_transfer_msg = Multi#multi_transfer_msg{payload_fragments_rev = PFR}},
+    PayloadSize = PayloadSize0 + byte_size(MsgPart),
+    validate_message_size(PayloadSize, MaxMessageSize),
+    PFR = case MsgPart of
+              <<>> -> PFR0;
+              _ -> [MsgPart | PFR0]
+          end,
+    Link = Link0#incoming_link{multi_transfer_msg = Multi#multi_transfer_msg{
+                                                      payload_fragments_rev = PFR,
+                                                      payload_size = PayloadSize}},
     {ok, [], Link, State};
 incoming_link_transfer(
   #'v1_0.transfer'{handle = ?UINT(HandleInt)},
@@ -2652,7 +2684,7 @@ incoming_link_transfer(
     Mc0 = try mc:init(mc_amqp, PayloadBin, #{})
           catch throw:Reason0 ->
                     link_error(?V_1_0_AMQP_ERROR_DECODE_ERROR,
-                               "failed to parse message: ~tp", [Reason0])
+                               "failed to parse message: ~tP", [Reason0, ?FORMAT_DEPTH_LIMIT])
           end,
     case lookup_target(LinkExchange, LinkRKey, Mc0, Vhost, User, IsJms, PermCache0) of
         {ok, X, RoutingKeys, Mc1, PermCache} ->
@@ -2692,8 +2724,8 @@ incoming_link_transfer(
                 {error, Reason} ->
                     link_error(
                       ?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                      "failed to deliver message (delivery-tag=~p, delivery-id=~p): ~tp",
-                      [DeliveryTag, DeliveryId, Reason])
+                      "failed to deliver message (delivery-tag=~p, delivery-id=~p): ~tP",
+                      [DeliveryTag, DeliveryId, Reason, ?FORMAT_DEPTH_LIMIT])
             end;
         {error, {anonymous_terminus, false}, #'v1_0.error'{} = Err} ->
             Disposition = case Settled of
@@ -2814,6 +2846,8 @@ lookup_routing_key(X = #exchange{name = #resource{name = XNameBin}},
             RKeys = [RKey],
             Mc = mc:set_annotation(?ANN_ROUTING_KEYS, RKeys, Mc1),
             {ok, X, RKeys, Mc, PermCache};
+        {list, CCs0} when length(CCs0) > ?MAX_ROUTING_HEADER_ENTRIES ->
+            {error, {anonymous_terminus, AnonTerm}, too_many_x_cc(length(CCs0))};
         {list, CCs0} = L ->
             try lists:map(fun({utf8, CC}) -> CC end, CCs0) of
                 CCs ->
@@ -2831,7 +2865,14 @@ bad_x_cc(Value) ->
     Desc = unicode:characters_to_binary(
              lists:flatten(
                io_lib:format(
-                 "bad value for 'x-cc' message-annotation: ~tp", [Value]))),
+                 "bad value for 'x-cc' message-annotation: ~tP", [Value, ?FORMAT_DEPTH_LIMIT]))),
+    #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INVALID_FIELD,
+                  description = {utf8, Desc}}.
+
+too_many_x_cc(Len) ->
+    Desc = unicode:characters_to_binary(
+             io_lib:format("'x-cc' message-annotation has ~b entries, the limit is ~b",
+                           [Len, ?MAX_ROUTING_HEADER_ENTRIES])),
     #'v1_0.error'{condition = ?V_1_0_AMQP_ERROR_INVALID_FIELD,
                   description = {utf8, Desc}}.
 
@@ -2916,12 +2957,24 @@ grant_link_credit(Credit, MaxLinkCredit, NumUnconfirmed) ->
     Credit =< MaxLinkCredit div 2 andalso
     NumUnconfirmed < MaxLinkCredit.
 
-maybe_grant_mgmt_link_credit(Credit, DeliveryCount, Handle)
-  when Credit =< ?MAX_MANAGEMENT_LINK_CREDIT div 2 ->
-    {?MAX_MANAGEMENT_LINK_CREDIT,
-     [flow(Handle, DeliveryCount, ?MAX_MANAGEMENT_LINK_CREDIT)]};
-maybe_grant_mgmt_link_credit(Credit, _, _) ->
-    {Credit, []}.
+maybe_grant_mgmt_link_credit(#management_link_pair{incoming_half = Handle,
+                                                   pending_responses = 0},
+                             #state{incoming_management_links = Links,
+                                    outgoing_pending = Pending} = State) ->
+    case Links of
+        #{Handle := #management_link{delivery_count = DeliveryCount,
+                                     credit = Credit} = Link0}
+          when Credit =< ?MAX_MANAGEMENT_LINK_CREDIT div 2 ->
+            Link = Link0#management_link{credit = ?MAX_MANAGEMENT_LINK_CREDIT},
+            Flow = flow(?UINT(Handle), DeliveryCount, ?MAX_MANAGEMENT_LINK_CREDIT),
+            State#state{incoming_management_links = maps:update(Handle, Link, Links),
+                        %% At the front so that the FLOW is not stuck behind blocked deliveries.
+                        outgoing_pending = queue:in_r(Flow, Pending)};
+        _ ->
+            State
+    end;
+maybe_grant_mgmt_link_credit(#management_link_pair{}, State) ->
+    State.
 
 ensure_source(#'v1_0.source'{
                  address = undefined,
@@ -2980,10 +3033,10 @@ ensure_source(#'v1_0.source'{
             QName = queue_resource(Vhost, QNameBin),
             {ok, QName, Source, PermCache, TopicPermCache};
         _ ->
-            exit_not_implemented("Dynamic source not supported: ~tp", [Source0])
+            exit_not_implemented("Dynamic source not supported: ~tP", [Source0, ?FORMAT_DEPTH_LIMIT])
     end;
 ensure_source(Source = #'v1_0.source'{dynamic = true}, _, _, _, _, _) ->
-    exit_not_implemented("Dynamic source not supported: ~tp", [Source]);
+    exit_not_implemented("Dynamic source not supported: ~tP", [Source, ?FORMAT_DEPTH_LIMIT]);
 ensure_source(Source0 = #'v1_0.source'{address = Address,
                                        durable = Durable},
               _SndSettle,  LinkName,
@@ -3147,10 +3200,10 @@ ensure_target(#'v1_0.target'{
                     Result
             end;
         _ ->
-            exit_not_implemented("Dynamic target not supported: ~p", [Target0])
+            exit_not_implemented("Dynamic target not supported: ~P", [Target0, ?FORMAT_DEPTH_LIMIT])
     end;
 ensure_target(Target = #'v1_0.target'{dynamic = true}, _, _, _) ->
-    exit_not_implemented("Dynamic target not supported: ~p", [Target]);
+    exit_not_implemented("Dynamic target not supported: ~P", [Target, ?FORMAT_DEPTH_LIMIT]);
 ensure_target(Target = #'v1_0.target'{address = Address,
                                       durable = Durable},
               _LinkName,
@@ -3307,39 +3360,57 @@ ensure_target_v1(Address, _, _, _, _) ->
     {error, {bad_address, Address}}.
 
 handle_outgoing_mgmt_link_flow_control(
-  #management_link{delivery_count = DeliveryCountSnd} = Link0,
-  #'v1_0.flow'{handle = Handle = ?UINT(HandleInt),
+  #management_link{name = Name,
+                   delivery_count = DeliveryCountSnd} = Link0,
+  #'v1_0.flow'{handle = ?UINT(HandleInt),
                delivery_count = MaybeDeliveryCountRcv,
                link_credit = ?UINT(LinkCreditRcv),
                drain = Drain0,
                echo = Echo0},
-  #state{outgoing_management_links = Links0,
-         outgoing_pending = Pending
+  #state{outgoing_management_links = Links,
+         management_link_pairs = Pairs
         } = State0) ->
-    Drain = default(Drain0, false),
-    Echo = default(Echo0, false),
+    Drain = boolean_field(drain, Drain0),
+    Echo = boolean_field(echo, Echo0),
     DeliveryCountRcv = delivery_count_rcv(MaybeDeliveryCountRcv),
     LinkCreditSnd = amqp10_util:link_credit_snd(DeliveryCountRcv, LinkCreditRcv, DeliveryCountSnd),
     {Count, Credit} = case Drain of
                           true -> {add(DeliveryCountSnd, LinkCreditSnd), 0};
                           false -> {DeliveryCountSnd, LinkCreditSnd}
                       end,
-    State = case Echo orelse Drain of
-                true ->
-                    Flow = #'v1_0.flow'{
-                              handle = Handle,
-                              delivery_count = ?UINT(Count),
-                              link_credit = ?UINT(Credit),
-                              available = ?UINT(0),
-                              drain = Drain},
-                    State0#state{outgoing_pending = queue:in(Flow, Pending)};
-                false ->
-                    State0
-            end,
     Link = Link0#management_link{delivery_count = Count,
                                  credit = Credit},
-    Links = maps:update(HandleInt, Link, Links0),
-    State#state{outgoing_management_links = Links}.
+    #management_link_pair{flow_reply = FlowReply0} = Pair0 = maps:get(Name, Pairs),
+    %% One FLOW may answer multiple requests [2.7.4]. It carries the latest drain mode.
+    FlowReply = case Echo orelse Drain orelse FlowReply0 =/= none of
+                    true -> Drain;
+                    false -> none
+                end,
+    Pair = Pair0#management_link_pair{flow_reply = FlowReply},
+    State = State0#state{outgoing_management_links = maps:update(HandleInt, Link, Links),
+                         management_link_pairs = maps:update(Name, Pair, Pairs)},
+    maybe_send_mgmt_flow_reply(Pair, State).
+
+maybe_send_mgmt_flow_reply(#management_link_pair{outgoing_half = Handle,
+                                                 pending_responses = 0,
+                                                 flow_reply = Drain} = Pair,
+                           #state{management_link_pairs = Pairs,
+                                  outgoing_management_links = Links,
+                                  outgoing_pending = Pending} = State)
+  when is_boolean(Drain) ->
+    #management_link{name = Name,
+                     delivery_count = Count,
+                     credit = Credit} = maps:get(Handle, Links),
+    Flow = #'v1_0.flow'{handle = ?UINT(Handle),
+                        delivery_count = ?UINT(Count),
+                        link_credit = ?UINT(Credit),
+                        available = ?UINT(0),
+                        drain = Drain},
+    State#state{management_link_pairs = maps:update(
+                                          Name, Pair#management_link_pair{flow_reply = none}, Pairs),
+                outgoing_pending = queue:in_r(Flow, Pending)};
+maybe_send_mgmt_flow_reply(#management_link_pair{}, State) ->
+    State.
 
 handle_outgoing_link_flow_control(
   #outgoing_link{queue_name = QName,
@@ -3358,8 +3429,8 @@ handle_outgoing_link_flow_control(
         } = State0) ->
     Ctag = handle_to_ctag(HandleInt),
     DeliveryCountRcv = delivery_count_rcv(MaybeDeliveryCountRcv),
-    Drain = default(Drain0, false),
-    Echo = default(Echo0, false),
+    Drain = boolean_field(drain, Drain0),
+    Echo = boolean_field(echo, Echo0),
     case CreditReqInFlight of
         false ->
             LinkCreditSnd = amqp10_util:link_credit_snd(
@@ -3460,8 +3531,8 @@ parse_deferred_tokens({map, KVList}) ->
         {Key, Other} ->
             protocol_error(
               ?V_1_0_AMQP_ERROR_INVALID_FIELD,
-              "rabbitmq:deferral-tokens must be an array of AMQP type utf8, got: ~tp",
-              [Other])
+              "rabbitmq:deferral-tokens must be an array of AMQP type utf8, got: ~tP",
+              [Other, ?FORMAT_DEPTH_LIMIT])
     end.
 
 delivery_count_rcv(?UINT(DeliveryCount)) ->
@@ -3473,6 +3544,14 @@ delivery_count_rcv(undefined) ->
     %% receiver, i.e., the delivery-countsnd specified in the flow state carried
     %% by the initial attach frame from the sender to the receiver." [2.6.7]
     ?INITIAL_DELIVERY_COUNT.
+
+boolean_field(_Field, undefined) ->
+    false;
+boolean_field(_Field, Bool) when is_boolean(Bool) ->
+    Bool;
+boolean_field(Field, Value) ->
+    protocol_error(?V_1_0_AMQP_ERROR_INVALID_FIELD,
+                   "invalid field '~s': ~tp", [Field, Value]).
 
 default(undefined, Default) -> Default;
 default(Thing, _Default) -> Thing.
@@ -3885,8 +3964,8 @@ declare_queue(QNameBin,
                        ReasonArgs);
         Other ->
             link_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
-                       "Failed to declare ~s: ~p",
-                       [rabbit_misc:rs(QName), Other])
+                       "Failed to declare ~s: ~P",
+                       [rabbit_misc:rs(QName), Other, ?FORMAT_DEPTH_LIMIT])
     end,
     {ok, PermCache}.
 
@@ -3939,10 +4018,10 @@ outcomes(#'v1_0.source'{outcomes = {array, symbol, Syms} = Outcomes}) ->
         [] ->
             Outcomes;
         Unsupported ->
-            exit_not_implemented("Outcomes not supported: ~tp", [Unsupported])
+            exit_not_implemented("Outcomes not supported: ~tP", [Unsupported, ?FORMAT_DEPTH_LIMIT])
     end;
 outcomes(#'v1_0.source'{outcomes = Unsupported}) ->
-    exit_not_implemented("Outcomes not supported: ~tp", [Unsupported]);
+    exit_not_implemented("Outcomes not supported: ~tP", [Unsupported, ?FORMAT_DEPTH_LIMIT]);
 outcomes(_) ->
     {array, symbol, ?OUTCOMES}.
 
@@ -4056,7 +4135,8 @@ maybe_detach_mgmt_link(
   HandleInt,
   State = #state{management_link_pairs = LinkPairs0,
                  incoming_management_links = IncomingLinks0,
-                 outgoing_management_links = OutgoingLinks0}) ->
+                 outgoing_management_links = OutgoingLinks0,
+                 outgoing_pending = Pending0}) ->
     case maps:take(HandleInt, IncomingLinks0) of
         {#management_link{name = Name}, IncomingLinks} ->
             Pair = #management_link_pair{outgoing_half = OutgoingHalf} = maps:get(Name, LinkPairs0),
@@ -4073,17 +4153,30 @@ maybe_detach_mgmt_link(
         error ->
             case maps:take(HandleInt, OutgoingLinks0) of
                 {#management_link{name = Name}, OutgoingLinks} ->
-                    Pair = #management_link_pair{incoming_half = IncomingHalf} = maps:get(Name, LinkPairs0),
+                    Pair0 = #management_link_pair{incoming_half = IncomingHalf} = maps:get(Name, LinkPairs0),
+                    Pair = Pair0#management_link_pair{outgoing_half = unattached,
+                                                      pending_responses = 0,
+                                                      flow_reply = none},
                     LinkPairs = case IncomingHalf of
                                     unattached ->
                                         maps:remove(Name, LinkPairs0);
                                     _ ->
-                                        maps:update(Name,
-                                                    Pair#management_link_pair{outgoing_half = unattached},
-                                                    LinkPairs0)
+                                        maps:update(Name, Pair, LinkPairs0)
                                 end,
-                    State#state{outgoing_management_links = OutgoingLinks,
-                                management_link_pairs = LinkPairs};
+                    Pending = case Pair0 of
+                                  #management_link_pair{pending_responses = 0} ->
+                                      Pending0;
+                                  #management_link_pair{} ->
+                                      queue:filter(fun(#pending_management_delivery{link_name = N}) ->
+                                                           N =/= Name;
+                                                      (_) ->
+                                                           true
+                                                   end, Pending0)
+                              end,
+                    maybe_grant_mgmt_link_credit(
+                      Pair, State#state{outgoing_management_links = OutgoingLinks,
+                                        management_link_pairs = LinkPairs,
+                                        outgoing_pending = Pending});
                 error ->
                     State
             end
@@ -4116,7 +4209,7 @@ check_resource_access(Resource, Perm, User, Cache) ->
             catch
                 exit:#amqp_error{name = access_refused,
                                  explanation = Msg} ->
-                    protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS, Msg, [])
+                    protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS, "~ts", [Msg])
             end
     end.
 
@@ -4167,7 +4260,7 @@ check_topic_authorisation(#exchange{type = topic,
             catch
                 exit:#amqp_error{name = access_refused,
                                  explanation = Msg} ->
-                    protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS, Msg, [])
+                    protocol_error(?V_1_0_AMQP_ERROR_UNAUTHORIZED_ACCESS, "~ts", [Msg])
             end
     end;
 check_topic_authorisation(_, _, _, _, Cache) ->

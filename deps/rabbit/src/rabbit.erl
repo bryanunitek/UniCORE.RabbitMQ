@@ -451,6 +451,12 @@ start_it(StartType) ->
                 ok
             catch
                 error:{badmatch, Error}:_ ->
+                    %% `start/2' does not run if a dependency of `rabbit'
+                    %% fails to start, so it cannot reset the boot state.
+                    case rabbit_boot_state:get() of
+                        booting -> rabbit_boot_state:set(stopped);
+                        _       -> ok
+                    end,
                     %% `rabbitmq_prelaunch' was started before `rabbit' above.
                     %% If the latter fails to start, we must stop the former as
                     %% well.
@@ -1197,7 +1203,7 @@ update_cluster_tags() ->
     Tags = application:get_env(rabbit, cluster_tags, []),
     ?LOG_DEBUG("Seeding cluster tags from application environment key...",
                #{domain => ?RMQLOG_DOMAIN_GLOBAL}),
-    rabbit_runtime_parameters:set_global(<<"cluster_tags">>, Tags, <<"internal_user">>).
+    ok = rabbit_runtime_parameters:set_global(<<"cluster_tags">>, Tags, <<"internal_user">>).
 
 
 -spec prevent_startup_if_node_was_reset() -> 'ok' | no_return().
