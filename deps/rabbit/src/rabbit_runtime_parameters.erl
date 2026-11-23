@@ -44,6 +44,9 @@
 -include_lib("rabbit_common/include/rabbit.hrl").
 -include_lib("kernel/include/logger.hrl").
 
+-define(DEFAULT_GLOBAL_MAX_NAME_LENGTH, 1024).
+-define(DEFAULT_GLOBAL_MAX_VALUE_SIZE, 131072).
+
 -export([parse_set/5, set/5, set_any/5, clear/4, clear_any/4, list/0, list/1,
          list_component/1, list/2, list_formatted/1, list_formatted/3,
          lookup/3, value/3, info_keys/0, clear_vhost/2,
@@ -52,6 +55,10 @@
 -export([parse_set_global/3, set_global/3, value_global/1,
          list_global/0, list_global_formatted/0, list_global_formatted/2,
          lookup_global/1, global_info_keys/0, clear_global/2]).
+
+-ifdef(TEST).
+-export([format_error/1]).
+-endif.
 
 %%----------------------------------------------------------------------------
 
@@ -102,10 +109,41 @@ parse_set_global(Name, String, ActingUser) ->
             {error_string, rabbit_misc:format("Could not parse JSON document: ~tp", [Reason])}
     end.
 
--spec set_global(binary(), term(), rabbit_types:username()) -> 'ok'.
+-spec set_global(binary(), term(), rabbit_types:username()) -> ok_or_error_string().
 
 set_global(Name, Term, ActingUser)  ->
     NameAsBinary = rabbit_data_coercion:to_binary(Name),
+    case check_global_limits(NameAsBinary, Term) of
+        ok ->
+            do_set_global(Name, NameAsBinary, Term, ActingUser);
+        {error_string, _} = Error ->
+            Error
+    end.
+
+-spec check_global_limits(ParamName :: binary(), Term :: term()) -> ok_or_error_string().
+
+check_global_limits(ParamName, Term) ->
+    Params = application:get_env(rabbit, runtime_parameters, []),
+    Global = proplists:get_value(global, Params, []),
+    MaxNameLength = proplists:get_value(max_name_length, Global, ?DEFAULT_GLOBAL_MAX_NAME_LENGTH),
+    MaxValueSize = proplists:get_value(max_value_size, Global, ?DEFAULT_GLOBAL_MAX_VALUE_SIZE),
+    case byte_size(ParamName) > MaxNameLength of
+        true ->
+            {error_string,
+             rabbit_misc:format("global parameter name exceeds the maximum length of ~b bytes",
+                                [MaxNameLength])};
+        false ->
+            case erlang:external_size(Term) > MaxValueSize of
+                true ->
+                    {error_string,
+                     rabbit_misc:format("global parameter value exceeds the maximum size of ~b bytes",
+                                        [MaxValueSize])};
+                false ->
+                    ok
+            end
+    end.
+
+do_set_global(Name, NameAsBinary, Term, ActingUser) ->
     ?LOG_DEBUG("Setting global parameter '~ts' to ~tp", [NameAsBinary, Term]),
     StorageKey = case rabbit_feature_flags:is_enabled('rabbitmq_4.4.0') of
                       true ->
@@ -129,7 +167,12 @@ migrate_legacy_atom_keyed(NameAsBinary) ->
     end.
 
 format_error(L) ->
-    {error_string, rabbit_misc:format_many([{"Validation failed~n", []} | L])}.
+    {error_string,
+     lists:flatten(
+       ["Validation failed\n\n" |
+        [io_lib:format(F ++ "~n", [rabbit_misc:limit_term(Arg) || Arg <- A],
+                       [{chars_limit, ?FORMAT_CHARS_LIMIT}])
+         || {F, A} <- L]])}.
 
 -spec set_any(rabbit_types:vhost(), binary(), binary(), term(),
               rabbit_types:user() | rabbit_types:username() | 'none')

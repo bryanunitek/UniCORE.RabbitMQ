@@ -37,6 +37,7 @@
          close_dest/1,
          ack/3,
          nack/2,
+         reject/2,
          status/1,
          forward/3,
          pending_count/1
@@ -53,7 +54,7 @@
 
 -import(rabbit_misc, [pget/2, pget/3]).
 -import(rabbit_data_coercion, [to_binary/1]).
--import(rabbit_shovel_util, [validate_uri_fun/1,
+-import(rabbit_shovel_util, [validate_uri_fun/2,
                              obfuscated_uris/2,
                              deobfuscate_uris/1]).
 
@@ -153,7 +154,7 @@ validate_dest(_Def) ->
 
 validate_src_funs(_Def, User) ->
     [
-     {<<"src-uri">>, validate_uri_fun(User), mandatory},
+     {<<"src-uri">>, validate_uri_fun(amqp10, User), mandatory},
      {<<"src-address">>, fun rabbit_parameter_validation:binary/2, mandatory},
      {<<"src-prefetch-count">>, fun rabbit_parameter_validation:number/2, optional},
      {<<"src-consumer-name">>, fun rabbit_parameter_validation:binary/2, optional},
@@ -164,7 +165,7 @@ validate_src_funs(_Def, User) ->
     ].
 
 validate_dest_funs(_Def, User) ->
-    [{<<"dest-uri">>, validate_uri_fun(User), mandatory},
+    [{<<"dest-uri">>, validate_uri_fun(amqp10, User), mandatory},
      {<<"dest-address">>, fun rabbit_parameter_validation:binary/2, mandatory},
      {<<"dest-add-forward-headers">>, fun rabbit_parameter_validation:boolean/2, optional},
      {<<"dest-add-timestamp-header">>, fun rabbit_parameter_validation:boolean/2, optional},
@@ -197,8 +198,15 @@ connect_source(State = #{name := Name,
                         on_confirm -> unsettled
                     end,
     AttachFun = fun(S, L, A, SSM, D) ->
-                        Filter = translate_consumer_args_to_filter(CArgs),
-                        amqp10_client:attach_receiver_link(S, L, A, SSM, D, Filter, #{}, true)
+                        amqp10_client:attach_link(
+                          S, #{name => L,
+                               role => {receiver, #{address => A,
+                                                    durable => D}, self()},
+                               snd_settle_mode => SSM,
+                               rcv_settle_mode => first,
+                               filter => translate_consumer_args_to_filter(CArgs),
+                               max_message_size => persistent_term:get(max_message_size),
+                               raw_mode => true})
                 end,
     LinkNameOverride = case CName of
                            <<>> -> undefined;
@@ -251,8 +259,8 @@ connect(Name, SndSettleMode, Uri, Postfix, Addr, Map, AttachFun, LinkNameOverrid
                    rabbit_shovel_util:log_connection_failure(Reason, Uri, Name),
                    exit({shutdown, {connection_failed, Reason}})
            end,
-    {ok, Sess} = amqp10_client:begin_session(Conn),
     link(Conn),
+    {ok, Sess} = amqp10_client:begin_session(Conn),
     LinkName = case LinkNameOverride of
                    undefined ->
                        LinkName0 = rabbit_shovel_util:gen_unique_name(Name, Postfix),
@@ -327,8 +335,12 @@ dest_endpoint(#{shovel_type := dynamic,
 handle_source({amqp10_msg, _LinkRef, RawMsg}, State) ->
     Tag = amqp10_raw_msg:delivery_tag(RawMsg),
     Payload = amqp10_raw_msg:payload(RawMsg),
-    Msg = mc:init(mc_amqp, Payload, #{}),
-    rabbit_shovel_behaviour:forward(Tag, Msg, State);
+    try mc:init(mc_amqp, Payload, #{}) of
+        Msg ->
+            rabbit_shovel_behaviour:forward(Tag, Msg, State)
+    catch throw:Reason ->
+              reject_source_msg(Tag, Reason, State)
+    end;
 handle_source({amqp10_event, {connection, Conn, opened}},
               State = #{source := #{current := #{conn := Conn}}}) ->
     State;
@@ -465,6 +477,20 @@ nack(Tags, State = #{source := #{current := #{link := LinkRef}}}) ->
                   end, serial_number:ranges(Tags)),
     State.
 
+reject_source_msg(Tag, Reason, State = #{name := Name}) ->
+    ?LOG_WARNING("Shovel ~ts could not parse a source message: ~tp",
+                 [Name, Reason]),
+    reject_source_msg(Tag, State).
+
+reject_source_msg(Tag, State) ->
+    rabbit_shovel_behaviour:decr_remaining(
+      1, rabbit_shovel_behaviour:reject(Tag, State)).
+
+-spec reject(tag(), state()) -> state().
+reject(Tag, State = #{source := #{current := #{link := LinkRef}}}) ->
+    ok = amqp10_client_session:disposition(LinkRef, Tag, Tag, true, rejected),
+    State.
+
 status(#{dest := #{current := #{link_state := attached}}}) ->
     flow;
 status(#{dest := #{current := #{link_state := credited}}}) ->
@@ -498,7 +524,8 @@ forward(Tag, Msg0,
     OutTag = rabbit_data_coercion:to_binary(Tag),
     Msg1 = add_timestamp_header(State, add_forward_headers(State, Msg0)),
     Msg2 = mc:protocol_state(mc:convert(mc_amqp, Msg1)),
-    Msg3 = amqp10_raw_msg:new(AckMode =/= on_confirm, Tag, iolist_to_binary(Msg2)),
+    Payload = iolist_to_binary(Msg2),
+    Msg3 = amqp10_raw_msg:new(AckMode =/= on_confirm, Tag, Payload),
     case send_msg(Link, Msg3) of
         ok ->
             #{dest := Dst1} = State1 = rabbit_shovel_behaviour:incr_forwarded(State),
@@ -512,6 +539,11 @@ forward(Tag, Msg0,
                       State2 = rabbit_shovel_behaviour:ack(Tag, false, State1),
                       rabbit_shovel_behaviour:decr_remaining(1, State2)
               end);
+        {error, message_size_exceeded} ->
+            ?LOG_WARNING("Shovel ~ts cannot forward a ~b byte message: "
+                         "it exceeds the destination's maximum message size",
+                         [maps:get(name, State), byte_size(Payload)]),
+            reject_source_msg(Tag, State);
         Stop ->
             Stop
     end.
@@ -520,6 +552,8 @@ send_msg(Link, Msg) ->
     case amqp10_client:send_msg(Link, Msg) of
         ok ->
             ok;
+        {error, message_size_exceeded} = Err ->
+            Err;
         {error, insufficient_credit} ->
             receive {amqp10_event, {link, Link, credited}} ->
                     send_msg(Link, Msg)

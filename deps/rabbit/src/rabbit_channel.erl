@@ -171,7 +171,8 @@
              tick_timer,
              publishing_mode = false :: boolean(),
              %% for clients that do not respond to a `basic.cancel` with a `basic.cancel_ok`
-             pending_consumer_cancels = #{} :: #{rabbit_types:ctag() => reference()}
+             pending_consumer_cancels = #{} :: #{rabbit_types:ctag() => reference()},
+             pending_replies = {0, 0} :: {non_neg_integer(), non_neg_integer()} | untracked
             }).
 
 -define(QUEUE, lqueue).
@@ -183,9 +184,14 @@
 %% outside a transaction; this bounds that buffer.
 -define(MAX_CHANNEL_TX_MESSAGES, 10_000).
 
+-define(MAX_PENDING_REPLIES, 4_000).
+-define(MIN_MAX_PENDING_REPLY_BYTES, 33_554_432).
+
 -define(REFRESH_TIMEOUT, 15000).
 
 -define(CONSUMER_CANCEL_OK_TIMEOUT, 10_000).
+
+-define(CLOSE_OK_TIMEOUT, 5_000).
 
 -define(STATISTICS_KEYS,
         [reductions,
@@ -258,8 +264,8 @@
 
 start_link(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
            VHost, Capabilities, CollectorPid, Limiter) ->
-    start_link(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
-           VHost, Capabilities, CollectorPid, Limiter, undefined).
+    start(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
+          VHost, Capabilities, CollectorPid, Limiter, undefined, {0, 0}).
 
 -spec start_link
         (channel_number(), pid(), pid(), pid(), string(),
@@ -269,9 +275,15 @@ start_link(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
 
 start_link(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
            VHost, Capabilities, CollectorPid, Limiter, AmqpParams) ->
+    start(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
+          VHost, Capabilities, CollectorPid, Limiter, AmqpParams, untracked).
+
+start(Channel, ReaderPid, WriterPid, ConnPid, ConnName, User,
+      VHost, Capabilities, CollectorPid, Limiter, AmqpParams, PendingReplies) ->
     gen_server2:start_link(
       ?MODULE, [Channel, ReaderPid, WriterPid, ConnPid, ConnName,
-                User, VHost, Capabilities, CollectorPid, Limiter, AmqpParams], []).
+                User, VHost, Capabilities, CollectorPid, Limiter, AmqpParams,
+                PendingReplies], []).
 
 -spec flush(pid()) -> 'ok'.
 
@@ -427,7 +439,7 @@ pg_scope() ->
     rabbit:pg_scope_amqp091_channel().
 
 init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
-      Capabilities, CollectorPid, LimiterPid, AmqpParams]) ->
+      Capabilities, CollectorPid, LimiterPid, AmqpParams, PendingReplies]) ->
     process_flag(trap_exit, true),
     rabbit_process_flag:adjust_for_message_handling_proc(),
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CHAN}),
@@ -495,7 +507,8 @@ init([Channel, ReaderPid, WriterPid, ConnPid, ConnName, User, VHost,
                 direct_reply            = none,
                 delivery_flow           = Flow,
                 interceptor_state       = undefined,
-                queue_states            = rabbit_queue_type:init()
+                queue_states            = rabbit_queue_type:init(),
+                pending_replies         = PendingReplies
                },
     State1 = State#ch{
                interceptor_state = rabbit_channel_interceptor:init(State)},
@@ -584,12 +597,14 @@ handle_cast({method, Method, Content, Flow},
         flow   -> credit_flow:ack(Reader);
         noflow -> ok
     end,
-    try handle_method(rabbit_channel_interceptor:intercept_in(
+    try
+        ok = check_pending_replies(State),
+        handle_method(rabbit_channel_interceptor:intercept_in(
                         expand_shortcuts(Method, State), Content, IState),
-                      State) of
+                      State)
+    of
         {reply, Reply, NewState} ->
-            ok = send(Reply, NewState),
-            noreply(NewState);
+            noreply(send_reply(Reply, NewState));
         {noreply, NewState} ->
             noreply(NewState);
         stop ->
@@ -615,7 +630,8 @@ handle_cast(ready_for_close,
             State = #ch{cfg = #conf{state = closing,
                                     writer_pid = WriterPid}}) ->
     try
-        ok = rabbit_writer:send_command_sync(WriterPid, #'channel.close_ok'{})
+        ok = rabbit_writer:send_command_sync_timeout(
+               WriterPid, #'channel.close_ok'{}, ?CLOSE_OK_TIMEOUT)
     catch
         _Class:Reason ->
             ?LOG_DEBUG("Failed to send 'channel.close_ok' on a terminating connection, reason: ~tp", [Reason])
@@ -634,14 +650,12 @@ handle_cast(terminate, State = #ch{cfg = #conf{writer_pid = WriterPid}}) ->
 handle_cast({command, #'basic.consume_ok'{consumer_tag = CTag} = Msg},
             #ch{consumer_mapping = CMap} = State)
   when is_map_key(CTag, CMap) ->
-    ok = send(Msg, State),
-    noreply(consumer_monitor(CTag, State));
+    noreply(consumer_monitor(CTag, send_reply(Msg, State)));
 handle_cast({command, #'basic.consume_ok'{}}, State) ->
     %% a consumer was not found so just ignore this
     noreply(State);
 handle_cast({command, Msg}, State) ->
-    ok = send(Msg, State),
-    noreply(State);
+    noreply(send_reply(Msg, State));
 
 handle_cast({deliver_reply, _, _}, State) ->
     noreply(State);
@@ -668,6 +682,11 @@ handle_cast({queue_event, QName, Evt},
             rabbit_misc:protocol_error(Type, Reason, ReasonArgs)
     end.
 
+handle_info({writer_acks, WriterPid, Count, Bytes},
+            State = #ch{cfg = #conf{writer_pid = WriterPid},
+                        pending_replies = {PendingCount, PendingBytes}}) ->
+    noreply(State#ch{pending_replies = {PendingCount - Count,
+                                        PendingBytes - Bytes}});
 handle_info({bump_credit, Msg}, State) ->
     %% A rabbit_amqqueue_process is granting credit to our channel. If
     %% our channel was being blocked by this process, and no other
@@ -841,6 +860,47 @@ send(_Command, #ch{cfg = #conf{state = closing}}) ->
 send(Command, #ch{cfg = #conf{writer_pid = WriterPid}}) ->
     ok = rabbit_writer:send_command(WriterPid, Command).
 
+send_reply(Reply, State = #ch{pending_replies = untracked}) ->
+    ok = send(Reply, State),
+    State;
+send_reply(_Reply, State = #ch{cfg = #conf{state = closing}}) ->
+    State;
+send_reply(Reply, State = #ch{cfg = #conf{writer_pid = WriterPid},
+                              pending_replies = {Count, Bytes}}) ->
+    ok = rabbit_writer:send_command_and_ack(WriterPid, Reply),
+    State#ch{pending_replies = {Count + 1, Bytes}}.
+
+send_reply(Reply, Content, State = #ch{cfg = #conf{writer_pid = WriterPid},
+                                       pending_replies = untracked}) ->
+    ok = rabbit_writer:send_command(WriterPid, Reply, Content),
+    State;
+send_reply(Reply, Content, State = #ch{cfg = #conf{writer_pid = WriterPid},
+                                       pending_replies = {Count, Bytes}}) ->
+    ok = rabbit_writer:send_command_and_ack(WriterPid, Reply, Content),
+    State#ch{pending_replies = {Count + 1,
+                                Bytes + rabbit_writer:msg_size(Content)}}.
+
+check_pending_replies(#ch{pending_replies = {Count, Bytes}})
+  when Count >= ?MAX_PENDING_REPLIES ->
+    pending_replies_error(Count, Bytes);
+check_pending_replies(#ch{pending_replies = {Count, Bytes}})
+  when Bytes >= ?MIN_MAX_PENDING_REPLY_BYTES ->
+    MaxBytes = max(?MIN_MAX_PENDING_REPLY_BYTES,
+                   2 * persistent_term:get(max_message_size)),
+    case Bytes >= MaxBytes of
+        true -> pending_replies_error(Count, Bytes);
+        false -> ok
+    end;
+check_pending_replies(_State) ->
+    ok.
+
+-spec pending_replies_error(non_neg_integer(), non_neg_integer()) -> no_return().
+pending_replies_error(Count, Bytes) ->
+    rabbit_misc:protocol_error(
+      resource_error,
+      "~B replies (~B bytes) are pending delivery to the client",
+      [Count, Bytes]).
+
 format_soft_error(#amqp_error{name = N, explanation = E, method = M}) ->
     io_lib:format("operation ~ts caused a channel exception ~ts: ~ts", [M, N, E]).
 
@@ -950,6 +1010,19 @@ check_write_permitted_on_topics(#exchange{type = topic} = Resource, User, Mc, Au
 check_write_permitted_on_topics(_, _, _, _) ->
     ok.
 
+check_dead_letter_routing_key(DLX, Args, User, AuthzContext) ->
+    case rabbit_misc:table_lookup(Args, <<"x-dead-letter-routing-key">>) of
+        {longstr, RoutingKey} ->
+            case rabbit_exchange:lookup(DLX) of
+                {ok, X} ->
+                    check_topic_authorisation(X, User, RoutingKey, AuthzContext, write);
+                {error, not_found} ->
+                    ok
+            end;
+        _ ->
+            ok
+    end.
+
 check_read_permitted_on_topic(Resource, User, RoutingKey, AuthzContext) ->
     check_topic_authorisation(Resource, User, RoutingKey, AuthzContext, read).
 
@@ -967,6 +1040,19 @@ check_expiration_header(Props) ->
         {error, E} -> rabbit_misc:precondition_failed("invalid expiration '~ts': ~tp",
                                                       [Props#'P_basic'.expiration, E])
     end.
+
+check_routing_headers(#'P_basic'{headers = Headers}) ->
+    lists:foreach(
+      fun(Key) ->
+              case rabbit_basic:header(Key, Headers) of
+                  {_, array, Routes} when length(Routes) > ?MAX_ROUTING_HEADER_ENTRIES ->
+                      rabbit_misc:precondition_failed(
+                        "header '~ts' has ~b entries, the limit is ~b",
+                        [Key, length(Routes), ?MAX_ROUTING_HEADER_ENTRIES]);
+                  _ ->
+                      ok
+              end
+      end, ?ROUTING_HEADERS).
 
 check_internal_exchange(#exchange{name = Name, internal = true}) ->
     rabbit_misc:protocol_error(access_refused,
@@ -1251,6 +1337,7 @@ handle_method(#'basic.publish'{exchange    = ExchangeNameBin,
     DecContent0 = rabbit_binary_parser:ensure_content_decoded(Content),
     DecContent = #content{properties = Props} = override_reply_to(DecContent0, State1),
     check_expiration_header(Props),
+    check_routing_headers(Props),
     DoConfirm = Tx =/= none orelse ConfirmEnabled,
     {DeliveryOptions, State} =
         case DoConfirm of
@@ -1312,8 +1399,7 @@ handle_method(#'basic.ack'{delivery_tag = DeliveryTag,
               end};
 
 handle_method(#'basic.get'{queue = QueueNameBin, no_ack = NoAck},
-              _, State = #ch{cfg = #conf{writer_pid = WriterPid,
-                                         conn_pid = ConnPid,
+              _, State = #ch{cfg = #conf{conn_pid = ConnPid,
                                          user = User,
                                          virtual_host = VHostPath,
                                          authz_context = AuthzContext
@@ -1333,7 +1419,7 @@ handle_method(#'basic.get'{queue = QueueNameBin, no_ack = NoAck},
            end) of
         {ok, MessageCount, Msg, QueueStates} ->
             {ok, QueueType} = rabbit_queue_type:module(QueueName, QueueStates),
-            handle_basic_get(WriterPid, DeliveryTag, NoAck, MessageCount, Msg,
+            handle_basic_get(DeliveryTag, NoAck, MessageCount, Msg,
                              QueueType, State#ch{queue_states = QueueStates});
         {empty, QueueStates} ->
             {ok, QueueType} = rabbit_queue_type:module(QueueName, QueueStates),
@@ -2348,8 +2434,8 @@ maybe_complete_tx(State = #ch{unconfirmed = UC}) ->
     end.
 
 complete_tx(State = #ch{tx = committing}) ->
-    ok = send(#'tx.commit_ok'{}, State),
-    State#ch{tx = new_tx()};
+    State1 = send_reply(#'tx.commit_ok'{}, State),
+    State1#ch{tx = new_tx()};
 complete_tx(State = #ch{tx = failed}) ->
     {noreply, State1} = handle_exception(
                           rabbit_misc:amqp_error(
@@ -2591,7 +2677,7 @@ handle_method(#'queue.declare'{queue       = QueueNameBin,
                DLX ->
                    check_read_permitted(QueueName, User, AuthzContext),
                    check_write_permitted(DLX, User, AuthzContext),
-                   ok
+                   check_dead_letter_routing_key(DLX, Args, User, AuthzContext)
             end,
             case rabbit_amqqueue:declare(QueueName, Durable, AutoDelete,
                                          Args, Owner, Username) of
@@ -2787,21 +2873,19 @@ handle_deliver0(ConsumerTag, AckRequired,
     end,
     record_sent(deliver, QueueType, ConsumerTag, AckRequired, Msg, State).
 
-handle_basic_get(WriterPid, DeliveryTag, NoAck, MessageCount,
+handle_basic_get(DeliveryTag, NoAck, MessageCount,
                  Msg0 = {_QName, _QPid, _MsgId, Redelivered, Mc},
                  QueueType, State) ->
     Exchange = mc:exchange(Mc),
     [RoutingKey | _] = mc:routing_keys(Mc),
     Content = outgoing_content(Mc, State#ch.cfg#conf.msg_interceptor_ctx),
-    ok = rabbit_writer:send_command(
-           WriterPid,
-           #'basic.get_ok'{delivery_tag  = DeliveryTag,
-                           redelivered   = Redelivered,
-                           exchange      = Exchange,
-                           routing_key   = RoutingKey,
-                           message_count = MessageCount},
-           Content),
-    {noreply, record_sent(get, QueueType, DeliveryTag, not(NoAck), Msg0, State)}.
+    State1 = send_reply(#'basic.get_ok'{delivery_tag  = DeliveryTag,
+                                        redelivered   = Redelivered,
+                                        exchange      = Exchange,
+                                        routing_key   = RoutingKey,
+                                        message_count = MessageCount},
+                        Content, State),
+    {noreply, record_sent(get, QueueType, DeliveryTag, not(NoAck), Msg0, State1)}.
 
 outgoing_content(Mc, MsgIcptCtx) ->
     Mc1 = rabbit_msg_interceptor:intercept_outgoing(Mc, MsgIcptCtx),

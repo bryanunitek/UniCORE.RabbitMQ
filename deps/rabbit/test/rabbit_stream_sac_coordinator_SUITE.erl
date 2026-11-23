@@ -580,6 +580,59 @@ handle_connection_down_consumers_from_dead_connection_should_be_filtered_out_tes
 
     ok.
 
+convert_v8_to_v9_test(_) ->
+    Pid = self(),
+    GId = group_id(),
+    Consumers = [#consumer{pid = Pid, subscription_id = Id,
+                            owner = <<"owner">>, status = Status, ts = 1000 + Id}
+                 || {Id, Status} <-
+                        [{0, {connected, active}},
+                         {1, {connected, waiting}},
+                         {2, {connected, deactivating}},
+                         {3, {presumed_down, active}},
+                         {4, {presumed_down, waiting}},
+                         {5, {disconnected, active}},
+                         {6, {disconnected, waiting}},
+                         {7, {disconnected, deactivating}}]],
+    State0 = (state(#{GId => grp(Consumers), group_id(<<"empty">>) => grp([])}))
+                 #?STATE{conf = #{disconnected_timeout => 42_000}},
+    Expected = [C#consumer{ts = Ts}
+                || {C, Ts} <- lists:zip(Consumers, [0, 0, 0, 0, 0, 1005, 1006, 1007])],
+    State1 = State0#?STATE{groups = #{GId => grp(Expected),
+                                     group_id(<<"empty">>) => grp([])}},
+    ?assertEqual(State1, ?MOD:convert_v8_to_v9(State0)),
+    ?assertEqual(State1, ?MOD:convert_v8_to_v9(State1)),
+    ?assertEqual(state(), ?MOD:convert_v8_to_v9(state())),
+    ok.
+
+machine_version_upgrade_to_9_test(_) ->
+    GId = group_id(),
+    lists:foreach(
+      fun({From, Mod}) ->
+              Meta = #{index => 1, machine_version => From, system_time => 1000},
+              State0 = Mod:init(#{machine_version => From}),
+              Cmd = register_consumer_command(stream(), -1, name(), self(), 0),
+              {State1, {ok, true}, _} = Mod:apply(Meta, {sac, Cmd}, State0),
+              Sac1 = rabbit_stream_coordinator:sac_state(State1),
+              case From of
+                  7 ->
+                      {State8, ok, []} = rabbit_stream_coordinator:apply(
+                                          Meta#{machine_version := 8},
+                                          {machine_version, 7, 8}, State1),
+                      ?assertEqual(Sac1, rabbit_stream_coordinator:sac_state(State8));
+                  _ -> ok
+              end,
+              {State2, ok, []} = rabbit_stream_coordinator:apply(
+                                  Meta#{machine_version := 9},
+                                  {machine_version, From, 9}, State1),
+              #?STATE{groups = Groups} = rabbit_stream_coordinator:sac_state(State2),
+              #{GId := #group{consumers = [Consumer]}} = Groups,
+              ?assertEqual((csr(self(), 0, active))#consumer{ts = 0}, Consumer)
+      end, [{4, rabbit_stream_coordinator_v7},
+            {7, rabbit_stream_coordinator_v7},
+            {8, rabbit_stream_coordinator}]),
+    ok.
+
 import_state_v4_empty_test(_) ->
     OldMod = rabbit_stream_sac_coordinator_v4,
     OldState = OldMod:init_state(),
@@ -1752,6 +1805,65 @@ purge_nodes_test(_) ->
 
     stop_node(N1Pid),
     ok.
+
+purge_nodes_v9_removes_connections_in_order_test(_) ->
+    {N1Pid, N1} = start_node(?FUNCTION_NAME),
+    N1Pids = [new_process(N1) || _ <- lists:seq(1, 40)],
+    %% A map with more than 32 keys visits C before A, although A sorts first.
+    Iterated = maps:keys(maps:from_keys(N1Pids, true)),
+    [{C, A} | _] = [{Before, After}
+                    || {Before, After} <- lists:zip(lists:droplast(Iterated),
+                                                    tl(Iterated)),
+                       After < Before],
+    B = new_process(),
+    GId = group_id(),
+    State0 = state(#{GId => grp(1, [csr(A, {connected, waiting}),
+                                    csr(B, {connected, active}),
+                                    csr(C, {connected, waiting})]),
+                     group_id(<<"other">>) =>
+                     grp([csr(P) || P <- N1Pids -- [A, C]])}),
+    {#?STATE{groups = Groups1}, ok, _} =
+        ?MOD:apply(#{machine_version => 9}, purge_nodes_command([N1]), State0),
+    assertHasGroup(GId, grp(1, [csr(B, {connected, deactivating})]), Groups1),
+
+    stop_node(N1Pid),
+    ok.
+
+consumer_timestamps_from_command_metadata_test(_) ->
+    P0 = new_process(),
+    P1 = new_process(),
+    GId = group_id(),
+    Meta = #{machine_version => 9, system_time => 1000},
+    Active = state(#{GId => grp([csr(P0, {connected, active}),
+                                 csr(P1, {connected, waiting})])}),
+    Disconnected = state(#{GId => grp([csr(P0, {disconnected, active}),
+                                       csr(P1, {connected, waiting})])}),
+
+    {#?STATE{groups = Groups1}, {ok, true}, _} =
+        ?MOD:apply(Meta, register_consumer_command(stream(), -1, name(), P0, 0),
+                   state()),
+    ?assertEqual([1000], consumer_timestamps(GId, Groups1)),
+
+    {#?STATE{groups = Groups2}, ok, _} =
+        ?MOD:apply(Meta, activate_consumer_command(stream(), name()), Active),
+    ?assertEqual([1000, 1000], consumer_timestamps(GId, Groups2)),
+
+    {#?STATE{groups = Groups3}, ok, _} =
+        ?MOD:apply(Meta, connection_reconnected_command(P0), Disconnected),
+    ?assertMatch([1000, _], consumer_timestamps(GId, Groups3)),
+
+    {#?STATE{groups = Groups4}, _} =
+        ?MOD:handle_connection_down(Meta, P0, normal, Active),
+    ?assertEqual([1000], consumer_timestamps(GId, Groups4)),
+
+    {#?STATE{groups = Groups5}, _} =
+        ?MOD:presume_connection_down(Meta, P0, Disconnected),
+    ?assertEqual([1000, 1000], consumer_timestamps(GId, Groups5)),
+    ok.
+
+consumer_timestamps(GId, Groups) ->
+    #{GId := #group{consumers = Consumers}} = Groups,
+    [Ts || #consumer{ts = Ts} <- Consumers].
 
 node_disconnected_and_reconnected_test(_) ->
     N0 = node(),

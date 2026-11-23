@@ -46,6 +46,7 @@
 -define(MAX_PERMISSION_CACHE_SIZE, 12).
 -define(MAX_TRANSACTIONS, 16).
 -define(MAX_TRANSACTION_ACTIONS, 1024).
+-define(MAX_TRANSACTION_BODY_BYTES, 128 * 1024 * 1024).
 
 -record(conn_info, {
          conn_name    :: binary(),
@@ -237,6 +238,7 @@ info(protocol, #state{cfg = #cfg{version = Version}}) ->
                    end,
     {'STOMP', VersionTuple};
 info(vhost, #state{cfg = #cfg{vhost = Val}}) -> Val;
+info(node, _) -> node();
 info(user, #state{user = undefined}) -> undefined;
 info(user, #state{user = #user{username = Username}}) -> Username;
 info(channels, _) -> 1;
@@ -376,6 +378,7 @@ process_connect(Implicit, Frame,
                   FT = frame_transformer(Version),
                   Frame1 = FT(Frame),
                   {Auth, {Username, _}} = Creds = creds(Frame1, SSLLoginName, Config),
+                  ok ?= check_creds(Creds, PeerIp),
                   {ok, DefaultVHost} = application:get_env(rabbitmq_stomp, default_vhost),
                   VHost = login_header(Frame1, ?HEADER_HOST, DefaultVHost),
                   Heartbeat = login_header(Frame1, ?HEADER_HEART_BEAT, <<"0,0">>),
@@ -386,10 +389,12 @@ process_connect(Implicit, Frame,
                                                           auth_login = Username}},
                   {Username, AuthProps} = auth_props_for_creds(Creds, StateN1),
                   {ok, User} ?= rabbit_access_control:check_user_login(Username, AuthProps),
+                  rabbit_access_control:clear_max_heap_size(),
                   #user{username = AuthUsername} = User,
                   ok ?= check_vhost_exists(VHost, AuthUsername, PeerIp),
                   {ok, AuthzCtx} ?= check_vhost_access(VHost, User, PeerIp),
                   ok ?= check_vhost_connection_limit(VHost),
+                  ok ?= check_user_connection_limit(AuthUsername),
                   ok ?= check_user_loopback(AuthUsername, PeerIp),
                   rabbit_core_metrics:auth_attempt_succeeded(PeerIp, AuthUsername, stomp),
                   ok = register_connection(),
@@ -442,6 +447,9 @@ process_connect(Implicit, Frame,
                       error("Bad CONNECT",
                             "Access refused for user '~ts'",
                             [Username1], State);
+                  {error, missing_credentials} ->
+                      ?LOG_WARNING("STOMP login failed: no login or passcode provided"),
+                      error("Bad CONNECT", "No login or passcode provided", State);
                   {error, not_loopback, EUsername} ->
                       ?LOG_WARNING("STOMP login failed for user '~ts': "
                                    "this user's access is restricted to localhost",
@@ -450,6 +458,10 @@ process_connect(Implicit, Frame,
                   {error, quota_exceeded} ->
                       error("Bad CONNECT",
                             "Connection refused: vhost connection limit reached",
+                            State);
+                  {error, user_quota_exceeded} ->
+                      error("Bad CONNECT",
+                            "Connection refused: user connection limit reached",
                             State);
                   {error, node_connection_limit_exceeded} ->
                       error("Bad CONNECT",
@@ -482,7 +494,7 @@ stomp_proto_ver("1.2") -> ?STOMP_PROTO_V1_2.
 creds(_, _, #cfg{default_login       = DefLogin,
                  default_passcode    = DefPasscode,
                  force_default_creds = true}) ->
-    {config, {iolist_to_binary(DefLogin), iolist_to_binary(DefPasscode)}};
+    {config, {default_cred(DefLogin), default_cred(DefPasscode)}};
 creds(Frame, SSLLoginName,
       #cfg{default_login    = DefLogin,
            default_passcode = DefPasscode}) ->
@@ -493,6 +505,22 @@ creds(Frame, SSLLoginName,
         {not_found, SSLName} -> {ssl, {SSLName, none}};
         _                    -> {stomp_headers, PasswordCreds}
     end.
+
+%% A missing login or passcode is not a passwordless login, so the
+%% authentication backends must not see it.
+check_creds({_, {Username, Passcode}}, PeerIp)
+  when Username =:= undefined; Passcode =:= undefined ->
+    MetricUsername = case Username of
+                         undefined -> <<>>;
+                         _         -> Username
+                     end,
+    rabbit_core_metrics:auth_attempt_failed(PeerIp, MetricUsername, stomp),
+    {error, missing_credentials};
+check_creds(_, _) ->
+    ok.
+
+default_cred(undefined) -> undefined;
+default_cred(Value) -> iolist_to_binary(Value).
 
 auth_props_for_creds(Creds, #state{cfg = #cfg{
                                             vhost = VHost}}) ->
@@ -573,6 +601,7 @@ handle_frame('UNSUBSCRIBE', Frame, State) ->
     cancel_subscription(ConsumerTag, Frame, State);
 
 handle_frame('SEND', Frame, State) ->
+    check_expiration_header(Frame),
     maybe_with_transaction(
       Frame,
       fun(State0) ->
@@ -1318,7 +1347,7 @@ settle_acks(Acks, State = #state{queue_states = QueueStates0}) ->
                   case rabbit_queue_type:settle(QRef, complete, CTag,
                                                 MsgIds, Acc0) of
                       {ok, Acc, ActionsAcc} ->
-                          %% incr_queue_stats(QRef, MsgIds, State),
+                          messages_acknowledged(QRef, length(MsgIds), State),
                           {Acc, ActionsAcc0 ++ ActionsAcc};
                       {protocol_error, ErrorType, Reason, ReasonArgs} ->
                           rabbit_misc:protocol_error(ErrorType, Reason, ReasonArgs)
@@ -1412,6 +1441,7 @@ send_delivery(QName, MsgId,
                          Body,
                          State),
             maybe_notify_sent(DeliveryCtx),
+            messages_delivered(QName, AckMode, Redelivered, State),
             case AckMode of
                 client ->
                     DeliveredAt = os:system_time(millisecond),
@@ -1435,6 +1465,35 @@ maybe_notify_sent(undefined) ->
     ok;
 maybe_notify_sent({_, QPid, _}) ->
     ok = rabbit_amqqueue:notify_sent(QPid, self()).
+
+messages_delivered(QName, AckMode, Redelivered,
+                   #state{queue_states = QStates,
+                          cfg = #cfg{proto_ver = ProtoVer}}) ->
+    case rabbit_queue_type:module(QName, QStates) of
+        {ok, QType} ->
+            rabbit_global_counters:messages_delivered(ProtoVer, QType, 1),
+            case AckMode of
+                client ->
+                    rabbit_global_counters:messages_delivered_consume_manual_ack(ProtoVer, QType, 1);
+                _ ->
+                    rabbit_global_counters:messages_delivered_consume_auto_ack(ProtoVer, QType, 1)
+            end,
+            case Redelivered of
+                true -> rabbit_global_counters:messages_redelivered(ProtoVer, QType, 1);
+                false -> ok
+            end;
+        _ ->
+            ok
+    end.
+
+messages_acknowledged(QName, Num, #state{queue_states = QStates,
+                                         cfg = #cfg{proto_ver = ProtoVer}}) ->
+    case rabbit_queue_type:module(QName, QStates) of
+        {ok, QType} ->
+            rabbit_global_counters:messages_acknowledged(ProtoVer, QType, Num);
+        _ ->
+            ok
+    end.
 
 %%----------------------------------------------------------------------------
 %% Reply-To
@@ -1590,6 +1649,7 @@ begin_transaction(Transaction, State) ->
                   "Too many concurrent transactions (limit ~B)",
                   [?MAX_TRANSACTIONS], State);
         false ->
+            discard_transaction(Transaction),
             put({transaction, Transaction}, []),
             ok(State)
     end.
@@ -1604,10 +1664,40 @@ extend_transaction(Transaction, Fun, Frame, State0) ->
                             "Too many actions in transaction (limit ~B)",
                             [?MAX_TRANSACTION_ACTIONS], State);
                   false ->
-                      put({transaction, Transaction}, [{Frame, Fun} | Funs]),
-                      ok(State)
+                      Total = transaction_bytes() + frame_body_size(Frame),
+                      case Total > ?MAX_TRANSACTION_BODY_BYTES of
+                          true ->
+                              Message = "Transaction too large",
+                              Detail = rabbit_misc:format(
+                                         "Too many message body bytes in transactions (limit ~B)",
+                                         [?MAX_TRANSACTION_BODY_BYTES]),
+                              log_error(Message, Detail, none),
+                              {stop, error_close, send_error(Message, Detail, State)};
+                          false ->
+                              put(transaction_bytes, Total),
+                              put({transaction, Transaction}, [{Frame, Fun} | Funs]),
+                              ok(State)
+                      end
               end
       end).
+
+frame_body_size(#stomp_frame{body_iolist_rev = Body}) ->
+    iolist_size(Body).
+
+transaction_bytes() ->
+    case get(transaction_bytes) of
+        undefined -> 0;
+        N         -> N
+    end.
+
+discard_transaction(Transaction) ->
+    case erase({transaction, Transaction}) of
+        undefined ->
+            ok;
+        Funs ->
+            Size = lists:sum([frame_body_size(Frame) || {Frame, _} <- Funs]),
+            put(transaction_bytes, transaction_bytes() - Size)
+    end.
 
 transaction_count() ->
     length([1 || {{transaction, _}, _} <- get()]).
@@ -1630,7 +1720,7 @@ commit_transaction(Transaction, State0) ->
                            after
                                erase(tx_settled_delivery_tags)
                            end,
-              erase({transaction, Transaction}),
+              discard_transaction(Transaction),
               FinalState
       end).
 
@@ -1638,7 +1728,7 @@ abort_transaction(Transaction, State0) ->
     with_transaction(
       Transaction, State0,
       fun (_Frames, State) ->
-              erase({transaction, Transaction}),
+              discard_transaction(Transaction),
               ok(State)
       end).
 
@@ -2187,8 +2277,8 @@ consume_queue(QRes, #{no_ack := NoAck,
                              authz_ctx = AuthzCtx,
                              queue_states  = QStates0}) ->
     check_resource_access(User, QRes, read, AuthzCtx),
-    rabbit_amqqueue:with_or_die(
-      QRes,
+    rabbit_amqqueue:with_exclusive_access_or_die(
+      QRes, self(),
       fun(Q1) ->
               case rabbit_amqqueue:basic_consume(Q1, NoAck, self(), none, false, Prefetch,
                                                  ConsumerTag, ExclusiveConsume, Args,
@@ -2279,6 +2369,20 @@ check_user_id(Message, User) ->
             rabbit_misc:protocol_error(access_refused, Reason, Args)
     end.
 
+check_expiration_header(Frame) ->
+    case rabbit_stomp_frame:header(Frame, ?HEADER_EXPIRATION) of
+        not_found ->
+            ok;
+        {ok, Expiration} ->
+            case rabbit_basic:parse_expiration(Expiration) of
+                {ok, _} ->
+                    ok;
+                {error, Reason} ->
+                    rabbit_misc:precondition_failed(
+                      "invalid expiration '~ts': ~tp", [Expiration, Reason])
+            end
+    end.
+
 check_topic_authorisation(#exchange{name = Name = #resource{virtual_host = VHost}, type = topic},
                           User = #user{username = Username},
                           RoutingKey, AuthzContext, Permission) ->
@@ -2363,6 +2467,16 @@ check_vhost_connection_limit(VHost) ->
             ?LOG_ERROR("STOMP connection failed: connection limit ~p is reached for vhost '~s'",
                        [Limit, VHost]),
             {error, quota_exceeded}
+    end.
+
+check_user_connection_limit(Username) ->
+    case rabbit_auth_backend_internal:is_over_connection_limit(Username) of
+        false ->
+            ok;
+        {true, Limit} ->
+            ?LOG_ERROR("STOMP connection failed: connection limit ~p is reached for user '~ts'",
+                       [Limit, Username]),
+            {error, user_quota_exceeded}
     end.
 
 check_user_loopback(Username, PeerIp) ->

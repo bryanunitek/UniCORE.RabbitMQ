@@ -45,6 +45,8 @@ client_set_max_packet_size_publish(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 client_set_max_packet_size_connack(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 client_set_max_packet_size_invalid(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 message_expiry(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+message_expiry_limit(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+message_expiry_limit_will(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 message_expiry_will_message(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 message_expiry_retained_message(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 session_expiry_classic_queue_disconnect_decrease(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
@@ -115,6 +117,8 @@ topic_alias_unknown(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 topic_alias_disallowed(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 topic_alias_retained_message(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 topic_alias_disallowed_retained_message(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+topic_alias_max_packet_size(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
+topic_alias_max_packet_size_retained_message(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 extended_auth(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 headers_exchange(Config) -> v5_SUITE:?FUNCTION_NAME(Config).
 consistent_hash_exchange(Config) -> v5_SUITE:?FUNCTION_NAME(Config).

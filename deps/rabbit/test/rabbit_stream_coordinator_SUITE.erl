@@ -25,6 +25,7 @@ all() ->
 all_tests() ->
     [
      listeners,
+     listeners_deleted_replica,
      machine_version_upgrade_to_2,
      machine_version_upgrade_to_3,
      machine_version_upgrade_to_7,
@@ -267,6 +268,63 @@ listeners(_) ->
        Stream6#stream.listeners
       ),
 
+    ok.
+
+listeners_deleted_replica(_) ->
+    Q = #resource{kind = queue, name = <<"stream">>, virtual_host = <<"/">>},
+    StreamId = "stream1",
+    N1 = r@n1,
+    N2 = r@n2,
+    LeaderPid = spawn(fun() -> ok end),
+    ReplicaPid = spawn(fun() -> ok end),
+    ListPid1 = spawn(fun() -> ok end),
+    ListPid2 = spawn(fun() -> ok end),
+    Leader = #member{role = {writer, 1},
+                     state = {running, 1, LeaderPid}},
+    Replica = #member{role = {replica, 1},
+                      state = {running, 1, ReplicaPid},
+                      target = deleted},
+    Stream0 = #stream{id = StreamId,
+                      conf = #{name => StreamId},
+                      nodes = [N1, N2],
+                      members = #{N1 => Leader, N2 => Replica},
+                      queue_ref = Q},
+    State0 = #?STATE{streams = #{StreamId => Stream0}, monitors = #{}},
+
+    {State1, ok, Effs1} =
+        apply_cmd(meta(?LINE),
+                  {register_listener, #{pid => ListPid1,
+                                        node => N1,
+                                        stream_id => StreamId,
+                                        type => local_member}}, State0),
+    ?assertEqual(
+       [{monitor, process, ListPid1},
+        {send_msg, ListPid1,
+         {queue_event, Q, {stream_local_member_change, LeaderPid}}, cast}],
+       Effs1),
+
+    {State2, ok, Effs2} =
+        apply_cmd(meta(?LINE),
+                  {register_listener, #{pid => ListPid2,
+                                        node => N2,
+                                        stream_id => StreamId,
+                                        type => local_member}}, State1),
+    ?assertEqual(
+       [{monitor, process, ListPid2},
+        {send_msg, ListPid2, {queue_event, Q, deleted_replica}, cast}],
+       Effs2),
+    #{StreamId := #stream{listeners = Listeners}} = State2#?STATE.streams,
+    ?assertEqual(#{{ListPid1, member} => {N1, LeaderPid},
+                   {ListPid2, member} => {N2, ReplicaPid}},
+                 Listeners),
+
+    Stream1 = Stream0#stream{members = #{N2 => Replica},
+                             listeners = #{{ListPid1, member} => {N1, undefined}}},
+    ?assertMatch(
+       {_, [{send_msg, ListPid1, {queue_event, Q, deleted_replica}, cast}]},
+       rabbit_stream_coordinator:eval_listeners(8, Stream1, [])),
+    ?assertEqual({Stream1, []},
+                 rabbit_stream_coordinator:eval_listeners(9, Stream1, [])),
     ok.
 
 machine_version_upgrade_to_2(_) ->
@@ -1990,7 +2048,7 @@ action_failed_short_parks_and_reconciles(_) ->
     E = 1,
     StreamId = atom_to_list(?FUNCTION_NAME),
     LeaderPid = fake_pid(n1),
-    [Replica1, Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
+    [Replica1, _Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
     N2 = node(Replica1),
     S0 = started_stream(StreamId, LeaderPid, ReplicaPids),
     S1 = update_stream(meta(?LINE), {down, Replica1, boom}, S0),
@@ -2045,7 +2103,7 @@ action_failed_nodedown_waits_for_nodeup(_) ->
     E = 1,
     StreamId = atom_to_list(?FUNCTION_NAME),
     LeaderPid = fake_pid(n1),
-    [Replica1, Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
+    [Replica1, _Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
     N2 = node(Replica1),
     S0 = started_stream(StreamId, LeaderPid, ReplicaPids),
     S1 = update_stream(meta(?LINE), {down, Replica1, boom}, S0),
@@ -2084,7 +2142,7 @@ sleeping_nodeup_redriven_by_action_failed(_) ->
     E = 1,
     StreamId = atom_to_list(?FUNCTION_NAME),
     LeaderPid = fake_pid(n1),
-    [Replica1, Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
+    [Replica1, _Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
     N2 = node(Replica1),
     S0 = started_stream(StreamId, LeaderPid, ReplicaPids),
     S1 = update_stream(meta(?LINE), {down, Replica1, boom}, S0),
@@ -2146,10 +2204,10 @@ short_backoff_jitter(_) ->
 %% stopped when the writer goes down, so it takes part in the re-election stop
 %% phase immediately rather than waiting for its timer.
 sleeping_replica_woken_for_reelection(_) ->
-    E = 1,
+    _E = 1,
     StreamId = atom_to_list(?FUNCTION_NAME),
     LeaderPid = fake_pid(n1),
-    [Replica1, Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
+    [_Replica1, Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
     N3 = node(Replica2),
     S0 = started_stream(StreamId, LeaderPid, ReplicaPids),
     %% park the N3 replica on a (far-future) retry timer
@@ -2176,7 +2234,7 @@ action_failed_no_backoff_retries_immediately(_) ->
     E = 1,
     StreamId = atom_to_list(?FUNCTION_NAME),
     LeaderPid = fake_pid(n1),
-    [Replica1, Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
+    [Replica1, _Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
     N2 = node(Replica1),
     S0 = started_stream(StreamId, LeaderPid, ReplicaPids),
     S1 = update_stream(meta(?LINE), {down, Replica1, boom}, S0),
@@ -2204,7 +2262,7 @@ reconcile_drops_superseded_parked_entry(_) ->
     E = 1,
     StreamId = atom_to_list(?FUNCTION_NAME),
     LeaderPid = fake_pid(n1),
-    [Replica1, Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
+    [Replica1, _Replica2] = ReplicaPids = [fake_pid(n2), fake_pid(n3)],
     N2 = node(Replica1),
     Stream = started_stream(StreamId, LeaderPid, ReplicaPids),
     RetryAt = 1000,

@@ -359,6 +359,10 @@ credit_enq_enq_checkout_settled_credit_test(Config) ->
                                   end, FinalEffects)).
 
 
+make_credit_non_boolean_drain_test(_Config) ->
+    ?assertError(function_clause,
+                 rabbit_fifo:make_credit(<<"key">>, 1, 0, {ubyte, 1})).
+
 credit_with_drained_test(Config) ->
     Ctag = ?FUNCTION_NAME,
     Cid = {Ctag, self()},
@@ -4583,6 +4587,33 @@ aux_decorators_test(_) ->
     {no_reply, _, _, _} = handle_aux(leader, cast, eval, Aux9, RaAux),
     ?assertEqual(6, meck:num_calls(rabbit_quorum_queue, has_decorators, '_')),
     meck:unload(),
+    ok.
+
+aux_delayed_timer_capped_test(Config) ->
+    _ = ra_machine_ets:start_link(),
+    Aux0 = init_aux(?FUNCTION_NAME),
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    Far = erlang:system_time(nanosecond),
+    Msg = mc:set_annotation(dt, Far, mk_mc(<<"m1">>)),
+    {State, _} = enq_ts(Config, 1, 1, Msg, 100, init(Conf)),
+    RaAux = #{machine_state => State,
+              log => mock_log,
+              cfg => #cfg{},
+              last_applied => 0},
+    ok = meck:new(ra_log, []),
+    meck:expect(ra_log, last_index_term, fun (_) -> {0, 0} end),
+    ok = meck:new(ra_aux, [passthrough]),
+    meck:expect(ra_aux, effective_machine_version,
+                fun (_) -> rabbit_fifo:version() end),
+    meck:expect(ra_aux, wal_fill_ratio, fun (_) -> 0.0 end),
+    ok = meck:new(rabbit_quorum_queue, [passthrough]),
+    meck:expect(rabbit_quorum_queue, has_decorators, fun (_) -> false end),
+    {no_reply, _, _, Effects} = handle_aux(leader, cast, eval, Aux0, RaAux),
+    meck:unload(),
+    [{timer, expire_msgs, Timeout, {abs, true}}] =
+        [E || {timer, expire_msgs, _, _} = E <- Effects],
+    ?assert(Timeout - erlang:system_time(millisecond) < 365 * 86_400_000 + 1000),
     ok.
 
 has_notify_decorators(Effects) ->

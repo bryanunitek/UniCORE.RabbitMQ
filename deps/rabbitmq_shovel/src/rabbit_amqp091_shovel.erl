@@ -38,6 +38,7 @@
          close_dest/1,
          ack/3,
          nack/2,
+         reject/2,
          status/1,
          forward/3,
          pending_count/1
@@ -336,6 +337,11 @@ nack(Tags, State = #{source := #{current := {_, Chan, _}}}) ->
                   end, Tags),
     State.
 
+reject(Tag, State = #{source := #{current := {_, Chan, _}}}) ->
+    ok = amqp_channel:cast(Chan, #'basic.reject'{delivery_tag = Tag,
+                                                 requeue = false}),
+    State.
+
 source_uri(#{source := #{current := {_, _, Uri}}}) -> Uri.
 dest_uri(#{dest := #{current := {_, _, Uri}}}) -> Uri.
 
@@ -478,17 +484,15 @@ handle_dest({bump_credit, Msg}, State) ->
 handle_dest(_Msg, _State) ->
     not_handled.
 
-close_source(#{source := #{current := {Conn, Ch, _}} = Src}) ->
+close_source(#{source := #{current := {Conn, _Ch, _}} = Src}) ->
     _ = rabbit_shovel_util:cancel_expire_after_duration(Src),
-    _ = try amqp_channel:close(Ch) catch _:_ -> ok end,
     _ = try amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT) catch _:_ -> ok end,
     ok;
 close_source(_) ->
     %% It never connected, connection doesn't exist
     ok.
 
-close_dest(#{dest := #{current := {Conn, Ch, _}}}) ->
-    _ = try amqp_channel:close(Ch) catch _:_ -> ok end,
+close_dest(#{dest := #{current := {Conn, _Ch, _}}}) ->
     _ = try amqp_connection:close(Conn, ?MAX_CONNECTION_CLOSE_TIMEOUT) catch _:_ -> ok end,
     ok;
 close_dest(_) ->
